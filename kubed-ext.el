@@ -1,10 +1,10 @@
 ;;; kubed-ext.el --- Extensions for Kubed with Async Metrics -*- lexical-binding: t; -*-
 
 ;; Author: Chetan Koneru
-;; Version: 0.6.0
+;; Version: 0.7.0
 ;; URL: https://github.com/CsBigDataHub/kubed-ext
 ;; Keywords: tools, kubernetes
-;; Package-Requires: ((emacs "29.1") (kubed "0.6.1") (transient "0.13.2"))
+;; Package-Requires: ((emacs "29.1") (kubed "0.7.0") (transient "0.13.2"))
 
 ;;; Commentary:
 ;; kubed-ext adds practical Kubernetes dashboard behavior on top of kubed:
@@ -45,7 +45,7 @@
     ("\\`\\*kubed-top-" (display-buffer-same-window)))
   "Display rules installed by kubed-ext.")
 
-(defconst kubed-ext--supported-kubed-version "0.6.1"
+(defconst kubed-ext--supported-kubed-version "0.7.0"
   "Kubed version whose internal `kubed-update' shape kubed-ext overrides.")
 
 (defvar kubed-ext--original-list-mode-line-format nil
@@ -283,7 +283,7 @@ kubed's internals for the installed version."
   "Non-nil after kubed-ext has scanned for preexisting list buffers.")
 
 (defvar kubed-ext--selector-cache (make-hash-table :test 'equal)
-  "Cached label selectors keyed by (HOST TYPE CONTEXT NAMESPACE).")
+  "Cached label selectors keyed by (EENV TYPE CONTEXT NAMESPACE).")
 
 (defvar kubed-ext--stale-list-buffer-count 0
   "Number of hidden list buffers currently marked stale.")
@@ -299,22 +299,35 @@ kubed's internals for the installed version."
 ;;; ═══════════════════════════════════════════════════════════════
 
 (defvar kubed-ext--namespace-prefetch-contexts (make-hash-table :test 'equal)
-  "Context/host pairs for which namespace prefetch has been triggered.")
+  "Context/eenv pairs for which namespace prefetch has been triggered.")
 
 (defun kubed-ext--host-key (&optional directory)
-  "Return kubed's cache host key for DIRECTORY or `default-directory'."
+  "Return the remote host identity for DIRECTORY or `default-directory'.
+This is the bare `file-remote-p' host, used only where a stable host
+identity is needed (e.g. disk cache keys).  For kubed data-cache and
+buffer-matching keys use `kubed-ext--eenv-key' instead."
   (file-remote-p (or directory default-directory)))
 
-(defun kubed-ext--selector-cache-key (type context namespace host)
-  "Return the selector-cache key for TYPE/CONTEXT/NAMESPACE/HOST."
-  (list host type context namespace))
+(defun kubed-ext--eenv-key (&optional buffer)
+  "Return kubed 0.7.0's execution-environment key for BUFFER.
+This is the cache key kubed uses for `kubed--alist', `kubed-update', and
+list-buffer matching: a list of (HOST KUBECTL-PROGRAM BUFFER-LOCALS
+EXTRA).  Falls back to a host-only key on older kubed."
+  (if (fboundp 'kubed-execution-environment-key)
+      (kubed-execution-environment-key buffer)
+    (kubed-ext--host-key (and buffer
+                              (buffer-local-value 'default-directory buffer)))))
+
+(defun kubed-ext--selector-cache-key (type context namespace eenv)
+  "Return the selector-cache key for TYPE/CONTEXT/NAMESPACE/EENV."
+  (list eenv type context namespace))
 
 (defun kubed-ext--cache-current-selector ()
   "Store or clear this buffer's label selector in `kubed-ext--selector-cache'."
   (when (derived-mode-p 'kubed-list-mode)
     (let ((key (kubed-ext--selector-cache-key
                 kubed-list-type kubed-list-context kubed-list-namespace
-                (kubed-ext--host-key))))
+                (kubed-ext--eenv-key))))
       (if (and (bound-and-true-p kubed-ext-list-label-selector)
                (not (string-empty-p kubed-ext-list-label-selector)))
           (puthash key kubed-ext-list-label-selector kubed-ext--selector-cache)
@@ -327,7 +340,7 @@ kubed's internals for the installed version."
   (when (derived-mode-p 'kubed-list-mode)
     (remhash (kubed-ext--selector-cache-key
               kubed-list-type kubed-list-context kubed-list-namespace
-              (kubed-ext--host-key))
+              (kubed-ext--eenv-key))
              kubed-ext--selector-cache)
     (when kubed-ext--stale-list-buffer-p
       (setq kubed-ext--stale-list-buffer-p nil)
@@ -376,25 +389,24 @@ kubed's internals for the installed version."
      (setq kubed-ext--marked-id-set nil)
      (setq kubed-ext--marked-id-order nil)
      (setq kubed-ext--marked-id-set-dirty t)
-     (setq kubed-ext--filter-highlight-state nil)
-     (setq kubed-ext--persisted-mark-tags nil))))
+     (setq kubed-ext--filter-highlight-state nil))))
 
-(defun kubed-ext-prefetch-namespaces (&optional context host)
-  "Asynchronously prefetch namespace list for CONTEXT on HOST.
+(defun kubed-ext-prefetch-namespaces (&optional context eenv)
+  "Asynchronously prefetch namespace list for CONTEXT in EENV.
 Does nothing if namespaces are already cached or a fetch is in progress.
 This ensures `kubed-read-namespace' completions appear without delay."
   (let ((ctx (kubed-ext--usable-context
               (or context (ignore-errors (kubed-local-context)))))
-        (host (or host (kubed-ext--host-key))))
+        (eenv (or eenv (kubed-ext--eenv-key))))
     (when ctx
       (condition-case nil
           (when (and (not (alist-get 'resources
-                                     (kubed--alist host "namespaces" ctx nil)))
+                                     (kubed--alist eenv "namespaces" ctx nil)))
                      (not (process-live-p
                            (alist-get 'process
-                                      (kubed--alist host "namespaces" ctx nil)))))
-            (puthash (list ctx host) t kubed-ext--namespace-prefetch-contexts)
-            (kubed-update "namespaces" ctx nil host))
+                                      (kubed--alist eenv "namespaces" ctx nil)))))
+            (puthash (list ctx eenv) t kubed-ext--namespace-prefetch-contexts)
+            (kubed-update "namespaces" ctx nil eenv))
         (error nil)))))
 
 (defun kubed-ext--prefetch-namespaces-hook ()
@@ -1697,10 +1709,11 @@ Pairs are returned in current buffer display order."
     (kubed-ext--rebuild-mark-cache)))
 
 (defun kubed-ext--mark-cache-put (id)
-  "Record ID as marked in the current buffer mark cache."
+  "Record ID as marked in the current buffer mark cache.
+Rebuilds the cache first when it is stale (e.g. after a refresh) so marks
+preserved by `kubed-list-revert' are not lost by the incremental update."
   (when id
-    (unless (hash-table-p kubed-ext--marked-id-set)
-      (setq kubed-ext--marked-id-set (kubed-ext--make-id-set)))
+    (kubed-ext--ensure-mark-cache)
     (unless (gethash id kubed-ext--marked-id-set)
       (setq kubed-ext--marked-id-order
             (append kubed-ext--marked-id-order (list id))))
@@ -1708,10 +1721,12 @@ Pairs are returned in current buffer display order."
     (setq kubed-ext--marked-id-set-dirty nil)))
 
 (defun kubed-ext--mark-cache-remove (id)
-  "Record ID as unmarked in the current buffer mark cache."
+  "Record ID as unmarked in the current buffer mark cache.
+Rebuilds the cache first when it is stale (e.g. after a refresh) so marks
+preserved by `kubed-list-revert' are not lost by the incremental update."
   (when id
-    (when (hash-table-p kubed-ext--marked-id-set)
-      (remhash id kubed-ext--marked-id-set))
+    (kubed-ext--ensure-mark-cache)
+    (remhash id kubed-ext--marked-id-set)
     (setq kubed-ext--marked-id-order
           (delete id kubed-ext--marked-id-order))
     (setq kubed-ext--marked-id-set-dirty nil)))
@@ -1773,60 +1788,25 @@ Pairs are returned in current buffer display order."
   (setq kubed-ext--marked-id-set-dirty nil)
   (message "Unmarked all items."))
 
-;;; ── Mark Persistence Across Refreshes ──────────────────────────────
+;;; ── Mark Cache Invalidation Across Refreshes ───────────────────────
+;;
+;; kubed 0.7.0's `kubed-list-revert' preserves mark glyphs itself (it saves
+;; each marked row's tag substring before reprinting and re-applies it
+;; afterward).  kubed-ext therefore no longer walks every row to persist and
+;; restore marks on each refresh — an O(rows) cost that hurt huge lists.
+;; Instead we only invalidate the hash-based mark cache so the next batch
+;; operation rebuilds it lazily from whatever glyphs survived the revert.
 
-(defvar-local kubed-ext--persisted-mark-tags nil
-  "List of (ID . TAG) pairs marked before the last buffer refresh.
-Populated by `kubed-ext--persist-marks-before-revert' immediately
-before `kubed-list-revert' wipes the buffer, and consumed by
-`kubed-ext--restore-persisted-marks' after the reprint completes.
-Declared permanent-local so it survives `kill-all-local-variables'.")
-
-(put 'kubed-ext--persisted-mark-tags 'permanent-local t)
-
-(defun kubed-ext--mark-tag-string (tag)
-  "Return propertized list mark string for TAG."
-  (pcase tag
-    (?D (propertize "D" 'help-echo "Marked for deletion"))
-    (_  (propertize "*" 'face 'dired-marked 'help-echo "Selected"))))
-
-(defun kubed-ext--persist-marks-before-revert (&rest _)
-  "Save marked row IDs and tags before `kubed-list-revert' wipes them.
-Installed as `:before' advice on `kubed-list-revert'."
+(defun kubed-ext--mark-cache-dirty-after-revert (&rest _)
+  "Invalidate this buffer's mark cache after a list refresh.
+Installed as `:after' advice on `kubed-list-revert'.  Marks themselves are
+preserved by upstream `kubed-list-revert'; this only forces the kubed-ext
+mark cache to rebuild lazily on next use."
   (when (derived-mode-p 'kubed-list-mode)
-    (setq kubed-ext--persisted-mark-tags
-          (kubed-ext--marked-item-tags-with-tags kubed-ext--mark-tags))))
+    (setq kubed-ext--marked-id-set-dirty t)))
 
-(defun kubed-ext--restore-persisted-marks (&rest _)
-  "Re-mark rows saved before the last refresh with their original tag.
-Installed as `:after' advice on `kubed-list-revert'.
-Walks every visible row once; hash-table lookup keeps restore cost linear
-in row count.  Rows that no longer exist after the refresh are silently
-skipped."
-  (when (derived-mode-p 'kubed-list-mode)
-    (setq kubed-ext--marked-id-set (kubed-ext--make-id-set))
-    (setq kubed-ext--marked-id-order nil)
-    (setq kubed-ext--marked-id-set-dirty nil)
-    (when kubed-ext--persisted-mark-tags
-      (let ((tags (make-hash-table :test 'equal)))
-        (dolist (entry kubed-ext--persisted-mark-tags)
-          (puthash (car entry) (cdr entry) tags))
-        (save-excursion
-          (goto-char (point-min))
-          (while (not (eobp))
-            (when-let* ((id (tabulated-list-get-id))
-                        (tag (gethash id tags)))
-              (tabulated-list-put-tag (kubed-ext--mark-tag-string tag))
-              (puthash id t kubed-ext--marked-id-set)
-              (push id kubed-ext--marked-id-order))
-            (forward-line))))
-      (setq kubed-ext--marked-id-order
-            (nreverse kubed-ext--marked-id-order)))))
-
-(advice-add 'kubed-list-revert :before
-            #'kubed-ext--persist-marks-before-revert)
 (advice-add 'kubed-list-revert :after
-            #'kubed-ext--restore-persisted-marks)
+            #'kubed-ext--mark-cache-dirty-after-revert)
 (advice-add 'kubed-list-mark-for-deletion :after
             #'kubed-ext--mark-cache-dirty)
 (advice-add 'kubed-list-unmark :after
@@ -2047,17 +2027,31 @@ Set to nil to render every container, selector, and label row."
                     '("true" "false" "unknown")))
           parts))))
 
-(defun kubed-ext--colorize-column-value (header value &optional resource)
-  "Return VALUE propertized with a face based on HEADER and RESOURCE."
-  (let ((h (upcase (string-trim (or header ""))))
-        (value (if (stringp value) value (format "%s" value))))
+(defun kubed-ext--column-kind (header)
+  "Classify column HEADER into a colorize kind symbol.
+Return one of `status', `ready', `restart', `warnings', or `plain'.
+The cost of header classification is paid once per column so callers can
+dispatch per cell with `kubed-ext--colorize-cell-by-kind' without
+re-normalizing the header for every row."
+  (cond
+   ((kubed-ext--status-column-p header) 'status)
+   ((kubed-ext--ready-column-p header) 'ready)
+   ((kubed-ext--restart-column-p header) 'restart)
+   ((kubed-ext--warnings-column-p header) 'warnings)
+   (t 'plain)))
+
+(defun kubed-ext--colorize-cell-by-kind (kind value &optional resource)
+  "Return VALUE colorized for a column of KIND.
+KIND is a symbol from `kubed-ext--column-kind'.  This is the per-cell hot
+path: it performs no header classification, only value formatting."
+  (let ((value (if (stringp value) value (format "%s" value))))
     (cond
      ((kubed-ext-none-p value)
       (propertize "" 'face 'shadow))
-     ((kubed-ext--status-column-p h)
+     ((eq kind 'status)
       (let ((face (cdr (assoc value kubed-ext-status-faces))))
         (if face (propertize value 'face face) value)))
-     ((kubed-ext--ready-column-p h)
+     ((eq kind 'ready)
       (cond
        ((string-match "\\`\\([0-9]+\\)/\\([0-9]+\\)\\'" value)
         (let* ((r    (string-to-number (match-string 1 value)))
@@ -2074,7 +2068,7 @@ Set to nil to render every container, selector, and label row."
        ((member value '("Unknown" "unknown"))
         (propertize value 'face 'warning))
        (t value)))
-     ((kubed-ext--restart-column-p h)
+     ((eq kind 'restart)
       (let* ((n    (string-to-number value))
              (face (cond ((= n 0) nil)
                          ((< n 5) 'warning)
@@ -2082,12 +2076,17 @@ Set to nil to render every container, selector, and label row."
         (if face
             (propertize value 'face face 'kubed-sort-value n)
           (propertize value 'kubed-sort-value n))))
-     ((kubed-ext--warnings-column-p h)
+     ((eq kind 'warnings)
       (if (and (kubed-ext--strimzi-kafka-resource-p resource)
                (kubed-ext--boolean-list-value-p value))
           (propertize "" 'face 'shadow)
         (propertize value 'face 'warning)))
      (t value))))
+
+(defun kubed-ext--colorize-column-value (header value &optional resource)
+  "Return VALUE propertized with a face based on HEADER and RESOURCE."
+  (kubed-ext--colorize-cell-by-kind
+   (kubed-ext--column-kind header) value resource))
 
 (defun kubed-ext--colorize-wide-cell (header value)
   "Return VALUE propertized with a face based on column HEADER name."
@@ -3130,7 +3129,7 @@ Deletion is detected by positive timestamp match."
 Reads 11-element fetch vectors and produces 7-column display vectors:
 Name, Ready(x/y), Status, Restarts, Age, IP, Node."
   (let* ((raw  (alist-get 'resources
-                          (kubed--alist (kubed-ext--host-key)
+                          (kubed--alist (kubed-ext--eenv-key)
                                         kubed-list-type
                                         kubed-list-context
                                         kubed-list-namespace)))
@@ -3243,7 +3242,7 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
 (defun kubed-ext--deployment-entries ()
   "Custom entries for deployments with kubel-style Ready and Age."
   (let* ((raw (alist-get 'resources
-                         (kubed--alist (kubed-ext--host-key)
+                         (kubed--alist (kubed-ext--eenv-key)
                                        kubed-list-type
                                        kubed-list-context
                                        kubed-list-namespace)))
@@ -4676,12 +4675,12 @@ ERRBACK is called with error message on failure."
 (defvar kubed-ext-label-selector-history nil
   "History list for label selectors.")
 
-(defun kubed-ext--find-active-selector (type context namespace &optional host)
-  "Find the label selector for TYPE/CONTEXT/NAMESPACE on HOST.
+(defun kubed-ext--find-active-selector (type context namespace &optional eenv)
+  "Find the label selector for TYPE/CONTEXT/NAMESPACE in EENV.
 Selectors are cached by list identity to keep the update hot path from
 walking every Emacs buffer on each refresh.  A one-pass list-buffer scan
 is retained for cache misses and preexisting buffers."
-  (let* ((key (kubed-ext--selector-cache-key type context namespace host))
+  (let* ((key (kubed-ext--selector-cache-key type context namespace eenv))
          (cached (gethash key kubed-ext--selector-cache)))
     (or cached
         (catch 'found
@@ -4691,7 +4690,7 @@ is retained for cache misses and preexisting buffers."
                         (equal kubed-list-type type)
                         (equal kubed-list-context context)
                         (equal kubed-list-namespace namespace)
-                        (equal (kubed-ext--host-key) host))
+                        (equal (kubed-ext--eenv-key) eenv))
                (puthash key kubed-ext-list-label-selector
                         kubed-ext--selector-cache)
                (throw 'found kubed-ext-list-label-selector))))))))
@@ -4859,10 +4858,8 @@ Creates the buffer if it does not exist."
 (kubed-ext--set-key 'kubed-deployment-prefix-map "U" #'kubed-ext-rollout-undo)
 
 ;; ── kubed-list-mode (parent of all list modes) ────────────────────
-;;   "d" intentionally overrides kubed's mark-for-deletion (k9s-style).
-;;   "%" preserves the old mark-for-deletion workflow.
-(kubed-ext--set-key 'kubed-list-mode-map "d"   #'kubed-ext-list-describe-resource)
-(kubed-ext--set-key 'kubed-list-mode-map "%"   #'kubed-list-mark-for-deletion)
+;;   "M-d" describes the resource at point; "d" is kubed's native mark-for-deletion.
+(kubed-ext--set-key 'kubed-list-mode-map "M-d" #'kubed-ext-list-describe-resource)
 (kubed-ext--set-key 'kubed-list-mode-map "S"   #'kubed-ext-list-set-label-selector)
 (kubed-ext--set-key 'kubed-list-mode-map "c"   #'kubed-ext-copy-popup)
 (kubed-ext--set-key 'kubed-list-mode-map "b"   #'kubed-ext-switch-buffer)
@@ -4880,11 +4877,11 @@ Creates the buffer if it does not exist."
 
 ;; ── kubed-prefix-map ──────────────────────────────────────────────
 ;;   "d" belongs to deployments; use "k" (kubectl describe mnemonic).
-(kubed-ext--set-key 'kubed-prefix-map "k" #'kubed-ext-describe-resource)
+(kubed-ext--set-key 'kubed-prefix-map "D" #'kubed-ext-describe-resource)
 (kubed-ext--set-key 'kubed-prefix-map "F" #'kubed-ext-list-port-forwards)
 (kubed-ext--set-key 'kubed-prefix-map "b" #'kubed-ext-switch-buffer)
 (kubed-ext--set-key 'kubed-prefix-map "#" #'kubed-ext-show-command-log)
-(kubed-ext--set-key 'kubed-prefix-map "L" #'kubed-ext-logs-by-label)
+(kubed-ext--set-key 'kubed-prefix-map "l L" #'kubed-ext-logs-by-label)
 
 (with-eval-after-load 'kubed
   (when (boundp 'kubed-deployments-mode-map)
@@ -4900,7 +4897,7 @@ Creates the buffer if it does not exist."
                       ("t" "Eat terminal"       kubed-ext-pods-eat)
                       ("G" "Ghostel"            kubed-ext-pods-ghostel)
                       ("E" "Eshell"             kubed-ext-pods-eshell)
-                      ("A" "Ansi-term"          kubed-ext-pods-ansi-term)
+                      ("a" "Ansi-term"          kubed-ext-pods-ansi-term)
                       ("&" "Exec command"       kubed-ext-pods-command)
                       ("i" "Init container logs" kubed-ext-pods-logs-init-container)])
     ("nodes"       . [("T" "Top (metrics)"  kubed-ext-top-nodes)])
@@ -5115,7 +5112,7 @@ Creates the buffer if it does not exist."
                 ,@(when in-list
                     '([["View"
                         ("g" "Refresh"        kubed-list-update :transient t)
-                        ("d" "Describe"       kubed-ext-list-describe-resource)
+                        ("M-d" "Describe"       kubed-ext-list-describe-resource)
                         ("V" "Wide view"      kubed-ext-list-wide)
                         ("A" "Auto-refresh"   kubed-ext-auto-refresh-mode)
                         ("q" "Quit window"    quit-window)]
@@ -5138,7 +5135,7 @@ Creates the buffer if it does not exist."
        (when (fboundp 'kubed-list-transient)
          (call-interactively #'kubed-list-transient))))))
 
-(kubed-ext--set-key 'kubed-list-mode-map "?" #'kubed-ext-transient-menu)
+(kubed-ext--set-key 'kubed-list-mode-map "M-?" #'kubed-ext-transient-menu)
 (kubed-ext--set-key 'kubed-list-mode-map "C" #'kubed-ext-switch-context)
 (kubed-ext--set-key 'kubed-list-mode-map "N" #'kubed-ext-switch-namespace)
 (kubed-ext--set-key 'kubed-list-mode-map "R" #'kubed-ext-switch-resource)
@@ -5324,9 +5321,9 @@ This function deliberately avoids invoking kubectl synchronously so list
 refresh and recovery paths never block the Emacs UI on credential, DNS,
 VPN, or API-server delays.  If no safe cached context is available,
 return nil instead of guessing a different cluster context."
-  (let* ((host (kubed-ext--host-key))
-         (cached (and (boundp 'kubed-default-context-and-namespace-alist)
-                      (alist-get host kubed-default-context-and-namespace-alist
+  (let* ((eenv (kubed-ext--eenv-key))
+         (cached (and (boundp 'kubed--context-and-namespace-alist)
+                      (alist-get eenv kubed--context-and-namespace-alist
                                  nil nil #'equal)))
          (candidates (delq
                       nil
@@ -5365,25 +5362,26 @@ after a failed resolution so the next call knows to re-sanitize.  Reset
 to nil once sanitization runs successfully with nothing found.")
 
 (defun kubed-ext--sanitize-cached-context-namespace ()
-  "Clear poisoned entries from `kubed-default-context-and-namespace-alist'.
+  "Clear poisoned entries from `kubed--context-and-namespace-alist'.
 When kubectl fails (e.g. expired Azure token during `az login'), kubed
-caches the error string as both the context and namespace.  This function
-detects those poisoned entries and removes them so kubed will re-resolve
-on the next call.  Return non-nil when any entries were cleared."
-  (when (boundp 'kubed-default-context-and-namespace-alist)
+caches the error string as the context and/or namespace.  Each entry is
+\(EENV CONTEXT . NAMESPACE); this function removes entries whose context
+or namespace is actually a kubectl error string so kubed re-resolves on
+the next call.  Return non-nil when any entries were cleared."
+  (when (boundp 'kubed--context-and-namespace-alist)
     (let ((poisoned nil))
-      (dolist (entry kubed-default-context-and-namespace-alist)
-        (let ((ctx-ns (cdr entry)))
-          (when (and (consp ctx-ns)
-                     (or (kubed-ext--context-error-string-p (car ctx-ns))
-                         (kubed-ext--context-error-string-p (cdr ctx-ns))))
-            (push entry poisoned))))
+      (dolist (entry kubed--context-and-namespace-alist)
+        ;; ENTRY is (EENV CONTEXT . NAMESPACE): car=eenv, cadr=context,
+        ;; cddr=namespace.
+        (when (or (kubed-ext--context-error-string-p (cadr entry))
+                  (kubed-ext--context-error-string-p (cddr entry)))
+          (push entry poisoned)))
       (cond
        (poisoned
         (dolist (bad poisoned)
           (setf (alist-get (car bad)
-                           kubed-default-context-and-namespace-alist
-                           nil 'remove)
+                           kubed--context-and-namespace-alist
+                           nil 'remove #'equal)
                 nil))
         (message "Kubed-ext: cleared %d poisoned context/namespace cache %s"
                  (length poisoned)
@@ -5455,31 +5453,31 @@ Tries several buffer-naming conventions that kubed may use."
 (defvar kubed-ext--known-large-lists (make-hash-table :test 'equal)
   "Resource list keys previously observed at or above the large-list threshold.")
 
-(defun kubed-ext--large-list-key (type context namespace &optional host)
-  "Return the auto-refresh cache key for TYPE/CONTEXT/NAMESPACE/HOST."
-  (list (or host "") (or type "") (or context "") (or namespace "")))
+(defun kubed-ext--large-list-key (type context namespace &optional eenv)
+  "Return the auto-refresh cache key for TYPE/CONTEXT/NAMESPACE/EENV."
+  (list (or eenv "") (or type "") (or context "") (or namespace "")))
 
-(defun kubed-ext--cached-resource-count (type context namespace &optional host)
-  "Return cached row count for TYPE/CONTEXT/NAMESPACE on HOST."
-  (length (alist-get 'resources (kubed--alist host type context namespace))))
+(defun kubed-ext--cached-resource-count (type context namespace &optional eenv)
+  "Return cached row count for TYPE/CONTEXT/NAMESPACE in EENV."
+  (length (alist-get 'resources (kubed--alist eenv type context namespace))))
 
 (defun kubed-ext--remember-large-list-if-needed
-    (type context namespace host count)
-  "Remember TYPE/CONTEXT/NAMESPACE/HOST as large when COUNT reaches threshold."
+    (type context namespace eenv count)
+  "Remember TYPE/CONTEXT/NAMESPACE/EENV as large when COUNT reaches threshold."
   (when (and kubed-ext-auto-refresh-large-list-threshold
              (>= count kubed-ext-auto-refresh-large-list-threshold))
-    (puthash (kubed-ext--large-list-key type context namespace host)
+    (puthash (kubed-ext--large-list-key type context namespace eenv)
              t kubed-ext--known-large-lists)))
 
 (defun kubed-ext--large-list-auto-refresh-skip-p (type context namespace
-                                                       &optional host)
-  "Return non-nil when auto-refresh should skip TYPE/CONTEXT/NAMESPACE/HOST.
+                                                       &optional eenv)
+  "Return non-nil when auto-refresh should skip TYPE/CONTEXT/NAMESPACE/EENV.
 A list is skipped when its current cache is large or when it was
 previously observed as large in this Emacs session."
   (and kubed-ext-auto-refresh-large-list-threshold
-       (or (>= (kubed-ext--cached-resource-count type context namespace host)
+       (or (>= (kubed-ext--cached-resource-count type context namespace eenv)
                kubed-ext-auto-refresh-large-list-threshold)
-           (gethash (kubed-ext--large-list-key type context namespace host)
+           (gethash (kubed-ext--large-list-key type context namespace eenv)
                     kubed-ext--known-large-lists))))
 
 (defun kubed-ext--server-side-list-resource-p (type context)
@@ -5505,46 +5503,54 @@ selector."
    (when namespace (list "--namespace" namespace))
    (when selector (list "--selector" selector))))
 
-(defun kubed-ext--table-column-width (header rows index)
-  "Return display width for HEADER using ROWS at INDEX."
-  (max 6
-       (min 48
-            (apply #'max
-                   (string-width header)
-                   (mapcar (lambda (row)
-                             (string-width (or (nth index row) "")))
-                           rows)))))
+(defun kubed-ext--server-table-column-widths (headers rows)
+  "Return a list of display widths for HEADERS over ROWS in one pass.
+Each width is clamped to the 6..48 range.  Computing all column widths
+together keeps cost at O(rows*columns) instead of O(rows*columns^2)."
+  (let ((widths (mapcar #'string-width headers)))
+    (dolist (row rows)
+      (let ((ws widths)
+            (cells row))
+        (while (and ws cells)
+          (let ((w (string-width (or (car cells) ""))))
+            (when (> w (car ws))
+              (setcar ws w)))
+          (setq ws (cdr ws)
+                cells (cdr cells)))))
+    (mapcar (lambda (w) (max 6 (min 48 w))) widths)))
 
 (defun kubed-ext--server-table-format (headers rows)
   "Return `tabulated-list-format' vector for server table HEADERS and ROWS."
   (apply #'vector
          (cl-loop for header in headers
-                  for index from 0
-                  collect (list (capitalize header)
-                                (kubed-ext--table-column-width header rows index)
-                                t))))
+                  for width in (kubed-ext--server-table-column-widths
+                                headers rows)
+                  collect (list (capitalize header) width t))))
 
 (defun kubed-ext--server-table-entries (headers rows type)
-  "Return tabulated entries from server table HEADERS/ROWS for TYPE."
-  (mapcar (lambda (row)
-            (list (or (car row) "")
-                  (apply #'vector
-                         (cl-loop for header in headers
-                                  for index from 0
-                                  collect (kubed-ext--colorize-column-value
-                                           header (or (nth index row) "")
-                                           type)))))
-          rows))
+  "Return tabulated entries from server table HEADERS/ROWS for TYPE.
+Column colorize kinds are classified once per HEADERS and reused for
+every row, and ROWS are consumed in lockstep with the precomputed kinds
+so per-cell cost stays O(columns) instead of O(columns squared)."
+  (let ((kinds (mapcar #'kubed-ext--column-kind headers)))
+    (mapcar (lambda (row)
+              (list (or (car row) "")
+                    (apply #'vector
+                           (cl-loop for cell in row
+                                    for kind in kinds
+                                    collect (kubed-ext--colorize-cell-by-kind
+                                             kind (or cell "") type)))))
+            rows)))
 
-(defun kubed-ext--matching-list-buffer-p (buf type context namespace host)
-  "Return non-nil when BUF displays TYPE/CONTEXT/NAMESPACE on HOST."
+(defun kubed-ext--matching-list-buffer-p (buf type context namespace eenv)
+  "Return non-nil when BUF displays TYPE/CONTEXT/NAMESPACE in EENV.
+Buffer matching mirrors kubed 0.7.0's `kubed--list-buffers', comparing
+the full execution-environment key rather than only the remote host."
   (and (buffer-live-p buf)
        (equal (buffer-local-value 'kubed-list-type buf) type)
        (equal (buffer-local-value 'kubed-list-context buf) context)
        (equal (buffer-local-value 'kubed-list-namespace buf) namespace)
-       (equal (file-remote-p
-               (buffer-local-value 'default-directory buf))
-              host)))
+       (equal (kubed-ext--eenv-key buf) eenv)))
 
 (defun kubed-ext--apply-list-update-format (format)
   "Install server-side list FORMAT in the current list buffer when non-nil."
@@ -5560,14 +5566,14 @@ selector."
           (max 0 (+ kubed-ext--stale-list-buffer-count (if stale 1 -1))))))
 
 (defun kubed-ext--refresh-list-buffers-after-update
-    (type context namespace host &optional format)
-  "Revert visible list buffers for TYPE/CONTEXT/NAMESPACE on HOST.
+    (type context namespace eenv &optional format)
+  "Revert visible list buffers for TYPE/CONTEXT/NAMESPACE in EENV.
 When FORMAT is non-nil, install it as the buffer-local table format first.
 Hidden matching buffers are marked stale and re-rendered lazily when shown."
   (let ((bufs nil))
     (kubed-ext--for-each-list-buffer
      (lambda (buf)
-       (when (kubed-ext--matching-list-buffer-p buf type context namespace host)
+       (when (kubed-ext--matching-list-buffer-p buf type context namespace eenv)
          (if-let ((win (get-buffer-window buf t)))
              (progn
                (kubed-ext--apply-list-update-format format)
@@ -5804,12 +5810,12 @@ other error    → server responded; close circuit."
 ;; ── Wiring: feed kubed-update outcomes into the state machine ────
 
 (defun kubed-ext--update-list-buffers-after-process
-    (type context namespace host status err-buf-name)
-  "Update list buffer headers for TYPE/CONTEXT/NAMESPACE/HOST after STATUS.
+    (type context namespace eenv status err-buf-name)
+  "Update list buffer headers for TYPE/CONTEXT/NAMESPACE/EENV after STATUS.
 ERR-BUF-NAME is the stderr buffer name for failed updates."
   (kubed-ext--for-each-list-buffer
    (lambda (buf)
-     (when (kubed-ext--matching-list-buffer-p buf type context namespace host)
+     (when (kubed-ext--matching-list-buffer-p buf type context namespace eenv)
        (if (string= status "exited abnormally with code 1\n")
            (let ((err-buf (get-buffer err-buf-name)))
              (kubed-ext--set-header-error
@@ -5820,36 +5826,49 @@ ERR-BUF-NAME is the stderr buffer name for failed updates."
          (kubed-ext--clear-header-error))))))
 
 (defun kubed-ext--set-list-buffer-error-after-update
-    (type context namespace host message)
-  "Display parse/update MESSAGE in list buffers matching TYPE/CONTEXT/NAMESPACE/HOST."
+    (type context namespace eenv message)
+  "Display parse/update MESSAGE in list buffers matching TYPE/CONTEXT/NAMESPACE/EENV."
   (kubed-ext--for-each-list-buffer
    (lambda (buf)
-     (when (kubed-ext--matching-list-buffer-p buf type context namespace host)
+     (when (kubed-ext--matching-list-buffer-p buf type context namespace eenv)
        (kubed-ext--set-header-error message)))))
 
-(defun kubed-ext--kubed-update (type context &optional namespace host)
-  "Update Kubernetes resources TYPE in CONTEXT and NAMESPACE on HOST.
-This is a `kubed-update' override for kubed 0.6.1.  It intentionally
+(defun kubed-ext--set-list-update-flags
+    (type context namespace eenv in-progress failed)
+  "Set kubed update-status flags on list buffers matching the data slot.
+TYPE, CONTEXT, NAMESPACE, and EENV identify the matching list buffers.
+IN-PROGRESS and FAILED set the buffer-local `kubed--update-in-progress'
+and `kubed--last-update-failed' for parity with upstream `kubed-update'."
+  (kubed-ext--for-each-list-buffer
+   (lambda (buf)
+     (when (kubed-ext--matching-list-buffer-p buf type context namespace eenv)
+       (setq kubed--update-in-progress in-progress
+             kubed--last-update-failed failed)))))
+
+(defun kubed-ext--kubed-update (type context &optional namespace eenv)
+  "Update Kubernetes resources TYPE in CONTEXT and NAMESPACE for EENV.
+This is a `kubed-update' override for kubed 0.7.0.  It intentionally
 uses kubed private contracts: `kubed--alist' cache slots keyed by
-HOST/TYPE/CONTEXT/NAMESPACE, `kubed--columns' fetch specs, and
-`kubed-list-mode' buffer-local identifiers.  The override is installed
-only after a compatibility check and should be re-audited for every
-upstream kubed version change.
+EENV/TYPE/CONTEXT/NAMESPACE (the execution-environment key introduced in
+kubed 0.7.0), `kubed--columns' fetch specs, and `kubed-list-mode'
+buffer-local identifiers.  The override is installed only after a
+compatibility check and should be re-audited for every upstream kubed
+version change.
 
 The implementation adds kubed-ext selector/status handling and avoids
 noisy routine refresh messages."
   (kubed-ext--patch-type-timestamp-columns type)
-  (unless host
-    (setq host (file-remote-p default-directory)))
+  (unless eenv
+    (setq eenv (kubed-ext--eenv-key)))
   (setq context (kubed-ext--usable-context context))
   (when (process-live-p
-         (alist-get 'process (kubed--alist host type context namespace)))
+         (alist-get 'process (kubed--alist eenv type context namespace)))
     (user-error "Update in progress"))
   (let* ((out (get-buffer-create (format " *kubed-get-%s*" type)))
          (err (get-buffer-create (format " *kubed-get-%s-stderr*" type)))
          (columns (alist-get type kubed--columns
                              '(("NAME:.metadata.name")) nil #'string=))
-         (selector (kubed-ext--find-active-selector type context namespace host))
+         (selector (kubed-ext--find-active-selector type context namespace eenv))
          (server-side-table (kubed-ext--server-side-list-resource-p type context))
          (command (kubed-ext--list-command
                    type context namespace columns server-side-table selector))
@@ -5859,7 +5878,7 @@ noisy routine refresh messages."
     (when kubed-ext-command-log-enabled
       (kubed-ext--log-kubectl-command
        (mapconcat #'identity (seq-filter #'stringp command) " ")))
-    (setf (alist-get 'process (kubed--alist host type context namespace))
+    (setf (alist-get 'process (kubed--alist eenv type context namespace))
           (make-process
            :name (format "*kubed-get-%s*" type)
            :buffer out
@@ -5874,26 +5893,33 @@ noisy routine refresh messages."
                    (progn
                      (if server-side-table
                          (kubed-ext--handle-server-table-success
-                          out host type context namespace)
+                          out eenv type context namespace)
                        (kubed-ext--handle-update-success
-                        out host type context namespace columns))
+                        out eenv type context namespace columns))
+                     (kubed-ext--set-list-update-flags
+                      type context namespace eenv nil nil)
                      (kubed-ext--cb-on-success context))
                  (error
+                  (kubed-ext--set-list-update-flags
+                   type context namespace eenv nil t)
                   (kubed-ext--set-list-buffer-error-after-update
-                   type context namespace host (error-message-string err)))))
+                   type context namespace eenv (error-message-string err)))))
               ((string= status "exited abnormally with code 1\n")
                (with-current-buffer err
                  (goto-char (point-max))
                  (insert "\n" status))
+               (kubed-ext--set-list-update-flags
+                type context namespace eenv nil t)
                (kubed-ext--update-list-buffers-after-process
-                type context namespace host status err-buf-name)
+                type context namespace eenv status err-buf-name)
                (kubed-ext--cb-on-failure
                 context (or (kubed-ext--cb-read-stderr type)
-                            "kubectl exited with code 1")))))))))
+                            "kubectl exited with code 1")))))))
+    (kubed-ext--set-list-update-flags type context namespace eenv t nil)))
 
 (defun kubed-ext--handle-update-success
-    (out host type context namespace columns)
-  "Parse successful kubectl OUT for HOST and refresh matching list buffers.
+    (out eenv type context namespace columns)
+  "Parse successful kubectl OUT for EENV and refresh matching list buffers.
 TYPE, CONTEXT, NAMESPACE, and COLUMNS identify the kubed data slot and
 the custom-column parser layout."
   (let (new offsets eol)
@@ -5925,40 +5951,40 @@ the custom-column parser layout."
     (let ((resources (mapcar (lambda (c)
                                (list (car c) (apply #'vector c)))
                              new)))
-      (setf (kubed--alist host type context namespace)
+      (setf (kubed--alist eenv type context namespace)
             (list (cons 'resources resources)))
       (kubed-ext--remember-large-list-if-needed
-       type context namespace host (length resources)))
+       type context namespace eenv (length resources)))
     (kubed-ext--refresh-list-buffers-after-update
-     type context namespace host)))
+     type context namespace eenv)))
 
-(defun kubed-ext--handle-server-table-success (out host type context namespace)
-  "Parse server-side kubectl table OUT for HOST/TYPE/CONTEXT/NAMESPACE."
+(defun kubed-ext--handle-server-table-success (out eenv type context namespace)
+  "Parse server-side kubectl table OUT for EENV/TYPE/CONTEXT/NAMESPACE."
   (let ((raw (with-current-buffer out (buffer-string))))
     (cond
      ((or (string-empty-p (string-trim raw))
           (string-match-p "\\`[[:space:]]*No resources found" raw))
-      (setf (kubed--alist host type context namespace)
+      (setf (kubed--alist eenv type context namespace)
             (list (cons 'resources nil)))
       (kubed-ext--refresh-list-buffers-after-update
-       type context namespace host))
+       type context namespace eenv))
      (t
       (let* ((parsed (kubed-ext--parse-kubectl-table raw))
              (headers (car parsed))
              (rows (cdr parsed)))
         (if (null headers)
             (progn
-              (setf (kubed--alist host type context namespace)
+              (setf (kubed--alist eenv type context namespace)
                     (list (cons 'resources nil)))
               (kubed-ext--refresh-list-buffers-after-update
-               type context namespace host))
+               type context namespace eenv))
           (let ((resources (kubed-ext--server-table-entries headers rows type)))
-            (setf (kubed--alist host type context namespace)
+            (setf (kubed--alist eenv type context namespace)
                   (list (cons 'resources resources)))
             (kubed-ext--remember-large-list-if-needed
-             type context namespace host (length resources))
+             type context namespace eenv (length resources))
             (kubed-ext--refresh-list-buffers-after-update
-             type context namespace host
+             type context namespace eenv
              (kubed-ext--server-table-format headers rows)))))))))
 
 (defun kubed-ext--kubed-package-version ()
@@ -5970,10 +5996,13 @@ the custom-column parser layout."
       (package-version-join (package-desc-version desc)))))
 
 (defun kubed-ext--kubed-update-compatible-p ()
-  "Return non-nil when `kubed-update' has the shape kubed-ext overrides."
+  "Return non-nil when `kubed-update' has the shape kubed-ext overrides.
+kubed 0.7.0 renamed the 4th argument from HOST to EENV; both shapes share
+the same arity and call contract, so either is accepted."
   (and (fboundp 'kubed-update)
-       (equal (help-function-arglist 'kubed-update t)
-              '(type context &optional namespace host))))
+       (member (help-function-arglist 'kubed-update t)
+               '((type context &optional namespace eenv)
+                 (type context &optional namespace host)))))
 
 (defun kubed-ext--install-kubed-update-override ()
   "Install kubed-ext's guarded `kubed-update' override."
@@ -6081,7 +6110,7 @@ Reschedules itself after each tick with a fresh random delay."
             (push buf seen-buffers)
             (with-current-buffer buf
               (when (derived-mode-p 'kubed-list-mode)
-                (let ((host (kubed-ext--host-key)))
+                (let ((eenv (kubed-ext--eenv-key)))
                   (cond
                    ;; Circuit is open — skip and count.
                    ((kubed-ext--cb-open-p kubed-list-context)
@@ -6089,13 +6118,13 @@ Reschedules itself after each tick with a fresh random delay."
                    ;; An update is already in progress — skip silently.
                    ((process-live-p
                      (alist-get 'process
-                                (kubed--alist host kubed-list-type
+                                (kubed--alist eenv kubed-list-type
                                               kubed-list-context
                                               kubed-list-namespace))))
                    ;; Large cached lists are expensive; manual `g' still refreshes.
                    ((kubed-ext--large-list-auto-refresh-skip-p
                      kubed-list-type kubed-list-context kubed-list-namespace
-                     host)
+                     eenv)
                     (cl-incf skipped))
                    ;; Normal case — refresh.
                    (t
@@ -6115,11 +6144,11 @@ Reschedules itself after each tick with a fresh random delay."
 (setq kubed-list-mode-line-format
       '(:eval
         (let* ((ctx      kubed-list-context)
-               (host     (kubed-ext--host-key))
+               (eenv     (kubed-ext--eenv-key))
                (reason   (and ctx (kubed-ext--cb-open-p ctx)))
                (updating (process-live-p
                           (alist-get 'process
-                                     (kubed--alist host kubed-list-type
+                                     (kubed--alist eenv kubed-list-type
                                                    ctx
                                                    kubed-list-namespace))))
                (is-prod  (and ctx
@@ -6956,8 +6985,7 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
   (advice-remove 'kubed-list-update #'kubed-ext--cb-before-manual-refresh)
   (advice-remove 'kubed-list-revert #'kubed-ext-mark-port-forwards)
   (advice-remove 'kubed-list-revert #'kubed-ext--reapply-overlays)
-  (advice-remove 'kubed-list-revert #'kubed-ext--persist-marks-before-revert)
-  (advice-remove 'kubed-list-revert #'kubed-ext--restore-persisted-marks)
+  (advice-remove 'kubed-list-revert #'kubed-ext--mark-cache-dirty-after-revert)
   (advice-remove 'kubed-list-mark-for-deletion #'kubed-ext--mark-cache-dirty)
   (advice-remove 'kubed-list-unmark #'kubed-ext--mark-cache-dirty)
   (advice-remove 'kubed-stop-port-forward
@@ -7023,7 +7051,7 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
              (kubed-deployment-prefix-map "r" kubed-ext-rollout-history)
              (kubed-deployment-prefix-map "j" kubed-ext-jab-deployment)
              (kubed-deployment-prefix-map "U" kubed-ext-rollout-undo)
-             (kubed-list-mode-map "d" kubed-ext-list-describe-resource)
+             (kubed-list-mode-map "M-d" kubed-ext-list-describe-resource)
              (kubed-list-mode-map "S" kubed-ext-list-set-label-selector)
              (kubed-list-mode-map "c" kubed-ext-copy-popup)
              (kubed-list-mode-map "b" kubed-ext-switch-buffer)
@@ -7038,17 +7066,17 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
              (kubed-list-mode-map "A" kubed-ext-auto-refresh-mode)
              (kubed-list-mode-map "r" kubed-ext-switch-resource)
              (kubed-list-mode-map "$" kubed-ext-show-process-buffer)
-             (kubed-list-mode-map "?" kubed-ext-transient-menu)
+             (kubed-list-mode-map "M-?" kubed-ext-transient-menu)
              (kubed-list-mode-map "C" kubed-ext-switch-context)
              (kubed-list-mode-map "N" kubed-ext-switch-namespace)
              (kubed-list-mode-map "R" kubed-ext-switch-resource)
              (kubed-list-mode-map "Z" kubed-ext-circuit-breaker-reset)
              (kubed-list-mode-map "C-c C-k" kubed-ext-kill-all-buffers)
-             (kubed-prefix-map "k" kubed-ext-describe-resource)
+             (kubed-prefix-map "D" kubed-ext-describe-resource)
              (kubed-prefix-map "F" kubed-ext-list-port-forwards)
              (kubed-prefix-map "b" kubed-ext-switch-buffer)
              (kubed-prefix-map "#" kubed-ext-show-command-log)
-             (kubed-prefix-map "L" kubed-ext-logs-by-label)
+             (kubed-prefix-map "l L" kubed-ext-logs-by-label)
              (kubed-prefix-map "Q" kubed-ext-kill-all-buffers)
              (kubed-prefix-map "Z" kubed-ext-circuit-breaker-reset)
              (kubed-prefix-map "e" kubed-ext-logs-errors)
