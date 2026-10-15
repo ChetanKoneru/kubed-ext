@@ -1,257 +1,205 @@
-#+TITLE: kubed-ext.el
+#+TITLE: kubed-ext
 #+OPTIONS: toc:2
 
-* kubed with bells and whistles
+* Modular Kubernetes workflows
 
-#+html: <p align="center">
-#+html: <img src="https://img.shields.io/badge/Emacs-29.1+-7F5AB6?logo=gnuemacs&logoColor=white" alt="Emacs 29.1+"/>
-#+html: <img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg" alt="License: GPL v3"/>
-#+html: </p>
+=kubed-ext= adds isolated asynchronous resource tables, Stern logs, metrics,
+scoped actions and terminals to [[https://github.com/eshelyaron/kubed][Kubed]]. Native Kubed remains the base client.
+This is not complete k9s parity. See the [[file:docs/superpowers/verification/2026-11-14-modular-kubernetes-client.md][verification and compatibility report]]
+for measured results and remaining gaps.
 
-=kubed-ext= is an extension pack for [[https://github.com/eshelyaron/kubed][kubed]].  It keeps kubed as the base Kubernetes
-client and adds the day-to-day comforts people expect from tools like k9s:
-better columns, async top views, port-forward management, Strimzi actions,
-CRD columns, filtering, marking, terminals, and quieter error handling.
+* Dependencies and loading
 
-No extra Emacs async framework is required.  The package uses kubed, transient,
-and native Emacs processes.
+- Emacs 29.1+, Kubed 0.7.1, Transient 0.4+. Validation uses the running Emacs
+  31.1 server and installed Kubed 0.7.1; minimum-version execution is not tested.
+- =kubectl= for cluster operations; Stern for advanced streaming logs.
+- Optional terminal backends: vterm, eat, Ghostel. Built-in eshell/ansi-term
+  adapters are also available. Kubel is not required or uninstalled by us.
 
-* Highlights
+** Install with =use-package :vc=
 
-- *k9s-style resource lists*: richer columns for pods, nodes, services,
-  ingresses, PVs/PVCs, workloads, events, autoscalers, PDBs, and CRDs.
-- *CRD auto-discovery*: reads =additionalPrinterColumns= from CRDs and injects
-  them into kubed list buffers.  Strimzi Kafka views include k9s-like metadata
-  state and quieter warning display.  CRD metadata is cached on disk so resource
-  switching has custom resources immediately after startup.
-- *Async top*: non-blocking pod/node metrics buffers backed by =kubectl top=.
-- *Port-forwards*: discover ports from pods, services, and deployments; manage
-  active forwards from one buffer; highlight rows with active forwards.
-- *Filtering*: server-side label selectors plus substring filtering that dims
-  non-matches and lets you jump between hits.
-- *Marking*: Dired-like marks for batch delete and batch log workflows.
-- *Strimzi helpers*: pause/resume reconciliation, restart connectors, scale
-  KafkaConnect, and adjust KafkaTopic partitions.
-- *Pod terminals*: open vterm, eat, ghostel, eshell, ansi-term, or one-shot
-  shell commands into pods.
-- *Rollouts*: history, revision inspection, undo, and restart/jab actions.
-- *Less noisy refreshes*: routine refreshes avoid spamming =*Messages*=; errors
-  show where they help.
-
-* Requirements
-
-| Tool / package | Version | Required | Notes |
-|----------------+---------+----------+-------|
-| Emacs          | 29.1+   | yes      | tested with native package/vc workflows |
-| kubed          | 0.6.x   | yes      | base Kubernetes client |
-| transient      | 0.4+    | yes      | command menus |
-| kubectl        | any     | yes      | talks to your clusters |
-| vterm          | any     | optional | pod terminal backend |
-| eat            | any     | optional | pod terminal backend |
-| ghostel        | any     | optional | pod terminal backend |
-| kubed-tramp    | bundled | optional | eshell/dired into pods |
-
-* Install
-
-** use-package with =:vc=
+On Emacs 30+, the built-in =use-package= supports =:vc= installation from Git.
+On Emacs 29.1, use a version of =use-package= with =:vc= support, or use the
+manual loading example below. Install =kubectl= and =stern= separately and
+make sure they are available in Emacs's =exec-path=.
 
 #+begin_src emacs-lisp
 (use-package kubed
-  :vc (:url "https://github.com/eshelyaron/kubed" :branch "master")
-  :demand t)
+  :vc (:url "https://github.com/eshelyaron/kubed")
+  :demand t
+  :bind-keymap ("C-c k" . kubed-prefix-map))
 
 (use-package kubed-ext
-  :vc (:url "https://github.com/CsBigDataHub/kubed-ext" :branch "main")
+  :vc (:url "https://github.com/CsBigDataHub/kubed-ext")
   :after kubed
-  :demand t)
+  :demand t
+  :custom
+  (kubed-ext-stern-program "stern")
+  (kubed-ext-crd-discovery-enabled t)
+  (kubed-ext-resource-display-limit 1000)
+  (kubed-ext-log-retention-characters 200000))
 #+end_src
 
-** Manual
+Loading =kubed-ext= installs its integration automatically; no additional
+=:config (kubed-ext-setup)= is needed. Start with
+=M-x kubed-ext-list-resources=, or open a native Kubed list and press =?=.
+The =:vc= declarations install the repository's published default branch;
+uncommitted changes in this working tree are not included.
 
-#+begin_src bash
-git clone https://github.com/CsBigDataHub/kubed-ext ~/.emacs.d/site-lisp/kubed-ext
-#+end_src
+** Load a local checkout
+
+Add the source repository to =load-path=. The normal entry point is
+=require 'kubed-ext=. Loading the entry automatically runs the idempotent
+=kubed-ext-setup=. During development explicitly select source: a pre-existing
+untracked =kubed-ext.elc= is stale and has deliberately not been changed.
 
 #+begin_src emacs-lisp
-(add-to-list 'load-path "~/.emacs.d/site-lisp/kubed-ext")
-(require 'kubed-ext)
+(add-to-list 'load-path "/path/to/kubed-ext")
+(require 'kubed-ext "kubed-ext.el")
 #+end_src
 
-* Quick start
+If the feature is already loaded, explicitly reload =kubed-ext.el= with
+=load= and its full =.el= filename. Changed dependency modules must also be
+source-reloaded; =require= does not reload features already present.
 
-1. Run =M-x kubed-list-pods=.
-2. Press =?= for the context-aware menu.
-3. Press =C= to change context or =N= to change namespace.
-4. Press =R= to switch resource type.
-5. Press =g= to refresh.
+** Tests
 
-Useful first commands:
+The five ERT suites live in =tests/=. For development, add both the repository
+root and its =tests/= directory to =load-path= before loading the suites.
+The extra directory lets review regressions require the shared core test helpers.
+Run ERT in the existing Emacs session with =M-x ert=; test names start with
+=kubed-ext-=. When reusing a development session, select tests from current
+source files rather than obsolete tests left registered by earlier revisions.
 
-| Key / command | What it does |
-|---------------+--------------|
-| =?= | Open kubed-ext transient menu |
-| =d= | Describe resource at point |
-| =W= | Open =kubectl get -o wide= view |
-| =S= | Set server-side label selector |
-| =f= | Set substring filter |
-| =M-n= / =M-p= | Jump filter matches |
-| =m= / =u= | Mark / unmark row |
-| =M-m= / =M-u= | Mark / unmark all visible rows |
-| =X= | Delete marked resources |
-| =c= | Copy menu |
+* Native and enhanced keys
 
-* Common workflows
+Setup changes only =?= in native =kubed-list-mode-map=. Native =g= refresh,
+=RET= resource selection, =/= filter, =d= mark-for-deletion, =u= unmark,
+=x= delete-marked, =D= delete, =e= edit, =!= kubectl command, =w= copy,
+and =+= create remain upstream Kubed commands. Native marking and caches are
+not replaced by enhanced ones. =?= also opens the menu in enhanced tables,
+managed logs and metric buffers.
 
-** Metrics
+Enhanced resource tables have these keys (resource-module keys remain owned
+by that module):
 
-| Key / command | Scope |
-|---------------+-------|
-| =M-x kubed-ext-top-pods= | pod metrics |
-| =M-x kubed-ext-top-nodes= | node metrics |
-| =T= or =M= in pod list | pod metrics |
-| =M= in node list | node metrics |
-| =T= on a node | single-node top summary |
+| Keys | Behavior |
+|------+----------|
+| =g= | Async refresh, suppress stale responses |
+| =m u M U= | Mark / unmark / mark visible / clear all marks |
+| =/= / =+= | Literal client filter / show all retained rows |
+| =RET= / =d= / =y= | Show configured YAML/JSON / describe / copy popup |
+| =l= / =e= | Follow selected pod or supported workload / RE2 error logs |
+| =p= / =N= | Pod metrics for current list scope / node metrics for context |
+| =h= / =R= | Rollout history / confirmed restart (supported workloads) |
+| =f= / =F= | Forward selected pod/service/deployment / list forwards |
+| =v= / =!= | Pod vterm / prompted non-TTY exec with container discovery |
+| =D= / =x= | Confirmed selected / marked deletion |
+| =L= / =b= / =?= | Server label selector / buffer chooser / menu |
 
-** Port-forward
+Direct action keys validate their target or request a target. The menu hides
+row actions on headers and hides pod/rollout/log/Strimzi actions for unsupported
+selected types. Menu keys are unique: =r c n b g= navigate/refresh;
+=/ L a p N C= enhanced filtering/auto-refresh/metrics/CRD metadata;
+=RET d y l e h R f D= selected actions;
+=v s ! i P S= pod terminal/exec/init logs and Strimzi pause/resume;
+=F o H= forwards/output format/action history; =k t E= log stop/follow/filter;
+=q= closes the menu, =Q= disables integration. Menu =g= dispatches to the
+current native list, enhanced list, metrics, logs, forwards or rollout buffer.
 
-| Resource | Key |
-|----------+-----|
-| Pod | =F= |
-| Service | =F= |
-| Deployment | =F= |
-| Management buffer | =M-x kubed-ext-list-port-forwards= |
+Logs retain their own =g= restart, =s= stop, =c= clear, =F= follow-at-end,
+=f= live Go/RE2 filter and =o= Emacs-regexp occur keys. Metrics use =g= refresh.
+Port-forward and rollout buffers retain their module keymaps.
 
-Port candidates come from live pod/service/deployment specs.  Active forwards
-are tracked and highlighted in list buffers.
+* Scope and workflows
 
-** Logs and terminals
+=kubed-ext-list-resources= accepts type, context, namespace and selector.
+Nil namespace means all namespaces for namespaced enhanced resources; native
+Kubed's nil namespace semantics are not changed. A missing context resolves
+asynchronously once using Kubed's valid configured/cached default, then
+kubeconfig current context. Row operations resolve the default namespace.
+Output, logs, metrics, exec and terminal buffers retain the captured execution
+environment. Headers show only bounded scope labels, never environment plists.
+=kubed-ext-production-context-pattern= highlights matching contexts with a
+production warning. Fully-qualified CRD types
+work even when metadata discovery is denied. CRDs use compact discovery and
+validated environment/context-specific caches, not downloaded OpenAPI schemas
+or evaluated resource definitions. Secret list views use server tables;
+YAML/JSON Secret-value retrieval is deliberately rejected.
 
-| Key / command | What it does |
-|---------------+--------------|
-| =i= on pod | initContainer logs |
-| =C-c k L= | logs by label selector |
-| =v= on pod | vterm into pod |
-| =t= on pod | eat into pod |
-| =G= on pod | ghostel into pod |
-| =E= on pod | eshell via kubed-tramp |
-| =A= on pod | ansi-term |
-| =&= on pod | prompt for one shell command |
+=kubed-ext-switch-context= and =kubed-ext-switch-namespace= preserve the current
+resource and selector. Resource switching uses the resource module's completion
+and opens an enhanced table. Convenience =kubed-ext-jump-*= commands retain
+scope. Enhanced marks/filter/sort and identities stay buffer-local. Namespaced
+rows always use a stable =namespace/name= identity, including scoped refreshes
+whose server table omits =NAMESPACE=; cluster-scoped rows use their bare name.
+Rendered rows are capped at =kubed-ext-resource-display-limit= (1000 by
+default), with explicit =+= expansion up to =kubed-ext-resource-retain-limit=
+(5000). Parsing runs in 100-row idle batches. A cold CRD namespace view filters
+matching rows before the retention cap, so later target rows are not hidden by
+unrelated namespaces. Truncated datasets report the retention limit; narrow the
+namespace or selector for more rows. Auto-refresh is buffer-local
+and opt-in. Finite requests cap combined stdout/stderr at
+=kubed-ext-request-byte-limit= (8 MiB); oversized responses fail visibly.
+Metrics datasets cap each endpoint at 10000 items; node budgets aggregate in
+one pass instead of rescanning all pods per node.
 
-** Rollouts
+The action module owns describe/show/copy, deletion, rollout history/revision/
+undo/restart, Strimzi actions and IPv6-first (=::1=) forwards. Mutations require
+explicit context and confirmation. =kubed-ext-jab-deployment= now delegates to
+a confirmed rollout restart. The entry point does not overwrite module commands.
 
-| Key | Command |
-|-----+---------|
-| =r= | rollout history |
-| =U= | rollout undo |
-| =j= | restart/jab deployment |
+=kubed-ext-toggle-output-format= and =kubed-ext-set-output-format= affect the
+*next* resource display, not a previously opened output buffer.
+=kubed-ext-switch-buffer= chooses live native/enhanced workflows.
+=kubed-ext-show-command-log= shows up to 100 explicit action-module commands,
+shell-quoted for copying. It is not a global audit: discovery, logs, exec,
+forwards and copy-only requests are not all recorded. No generic process advice
+is installed. Commands can include sensitive patch arguments; treat history as
+sensitive and clear =kubed-ext--command-history= when appropriate.
 
-** Strimzi
+* Stern and terminals
 
-| Resource | Actions |
-|----------+---------|
-| Kafka / KafkaConnect | pause and resume reconciliation |
-| KafkaConnect | scale replicas |
-| KafkaConnector | pause, resume, restart |
-| KafkaTopic | set partition count |
+Selected targets are exact Stern queries; a chosen container uses an exact
+RE2 expression. Workload logs keep their actual resource type. Live filters
+use Go RE2, not Emacs regexp syntax. =occur= is a separate Emacs-regexp operation.
+Snapshot mode uses =--no-follow=; follow mode omits it. Unsupported limit or
+absolute-since options and missing Stern fall back to basic upstream Kubed logs
+where supported. Advanced Stern-only commands require Stern.
 
-* Configuration
+The upstream-compatible =since= argument is absolute (=--since-time=), not a
+Stern duration; any non-nil value uses upstream fallback. A legacy nil =since=
+also uses upstream Kubed so it retains its no-cutoff semantics instead of
+silently inheriting Stern's 48-hour default. Native Stern specifications omit
+=:since= to request their explicit one-hour Stern default. Nil =tail= remains
+nil. Snapshot plus tail zero is rejected because Stern does not support that
+combination; follow plus tail zero is valid.
 
-#+begin_src emacs-lisp
-;; Shell used by pod terminal commands.
-(setq kubed-ext-pod-shell "/bin/bash")
+Managed logs stop on kill/restart/major-mode change, suppress replaced-process output and bound
+retention with =kubed-ext-log-retention-characters=. Pod terminal commands use
+asynchronous container discovery; session labels include context/namespace/
+pod/container. Noninteractive exec accepts argv and does not request a TTY.
+Eshell starts in the resolved Kubed TRAMP pod/container directory; it does not
+send an interactive =exec -it= subprocess. Terminal and metrics cleanup also
+runs before a major-mode change. Dead forwarding sessions are removed from
+the registry rather than retaining launch environments as history.
 
-;; Display resource buffers as YAML or JSON.
-(setq kubed-ext-output-format "json")
+* Disable and migration
 
-;; Use a non-default kubectl path.
-(setq kubed-kubectl-program "/usr/local/bin/kubectl")
+=kubed-ext-setup= makes no cluster requests. =kubed-ext-disable= and the entry
+unload hook stop owned transport, resource timers/discovery, logs, terminals,
+port forwards and metrics callbacks. Modules stay loaded because globally
+unloading shared dependencies could invalidate unrelated consumers. Buffers
+remain available for inspection; new explicit commands can start work again.
+Run setup to reinstall entry keys/advice after disable.
 
-;; Customize status colors.
-(setf (alist-get "Running" kubed-ext-status-faces nil nil #'string=) 'bold)
-(push '("Degraded" . error) kubed-ext-status-faces)
+Bindings are restored only when the actual keymap still contains the command
+installed by this entry point. Later user edits survive; module-defined base
+keymaps remain. The only advice is narrow explicit-action history advice,
+removed on disable. No =kubed-update= override, global CRD column mutation,
+CRD-derived eval, generic process advice or global TRAMP tuning is installed.
 
-;; Enable command log when you want audit/debug detail.
-(setq kubed-ext-command-log-enabled t)
-
-;; CRD metadata cache.  Default:
-;; ~/.emacs.d/.cache/kubed-ext/crds/
-(setq kubed-ext-crd-cache-enabled t)
-(setq kubed-ext-crd-cache-directory
-      (expand-file-name ".cache/kubed-ext/crds/" user-emacs-directory))
-#+end_src
-
-* Notes
-
-- CRD discovery is cached in memory and on disk by context.  Cached CRDs load
-  first, then kubed-ext refreshes from the cluster asynchronously and rewrites
-  the cache when CRD metadata changes.
-- Use =M-x kubed-ext-refresh-crd-columns= when you want an immediate manual CRD
-  refresh.  It does not delete the disk cache.
-- Label selectors are sent to kubectl as =--selector=, so large lists filter on
-  the API server.
-- Substring filtering is visual only: non-matching rows are dimmed, not removed.
-- Routine refreshes are intentionally quiet.  Look at error banners, top buffer
-  headers, or the command log when debugging.
-
-* Troubleshooting
-
-** Metrics are empty
-
-Check metrics-server first:
-
-#+begin_src bash
-kubectl top nodes
-kubectl top pods -A
-#+end_src
-
-** CRD columns are missing
-
-Run =M-x kubed-ext-refresh-crd-columns= and reopen the list buffer.  If a CRD
-does not define =additionalPrinterColumns=, kubed-ext has little to display
-beyond name/age unless the resource has a built-in extension.
-
-** Port-forward fails
-
-Check the resource, namespace, context, and local port:
-
-#+begin_src bash
-kubectl get <type> <name> -n <namespace>
-lsof -i :<local-port>
-#+end_src
-
-** Pod terminal does not open
-
-Install the backend you are using (=vterm=, =eat=, or =ghostel=), or use
-built-in =ansi-term= / shell command support.  Also verify the pod has
-=/bin/sh= or your configured =kubed-ext-pod-shell=.
-
-** Too much command output
-
-Keep =kubed-ext-command-log-enabled= nil for normal use.  Enable it only while
-debugging kubectl calls.
-
-* Development
-
-- Keep public names under =kubed-ext-= and internal names under =kubed-ext--=.
-- Preserve kubed behavior unless the extension is deliberately adding a feature.
-- Prefer async =make-process= for cluster calls that can block.
-- Handle =nil=, empty string, =<none>=, and =<unknown>= consistently.
-- Byte-compile cleanly before submitting changes.
-
-#+begin_src bash
-emacs -Q --batch \
-  --eval "(package-initialize)" \
-  -L /path/to/kubed \
-  -L . \
-  --eval '(byte-compile-file "kubed-ext.el")'
-#+end_src
-
-* License
-
-GPL-3.0.  See =LICENSE=.
-
-* Thanks
-
-- [[https://github.com/eshelyaron/kubed][kubed]] for the Emacs Kubernetes foundation.
-- [[https://github.com/abrochard/kubel][kubel]] for inspiration around filtering, marking, and error display.
-- [[https://k9scli.io/][k9s]] for the operational UX target.
+The original =HEAD:kubed-ext.el= exports were audited, not assumed private.
+Some public wide-list, numeric, prefetch, process-buffer and circuit-breaker
+helpers are still absent. These gaps and intentionally retired global internals
+are listed separately in the verification report.
