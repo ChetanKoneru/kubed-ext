@@ -6,7 +6,8 @@
 ;;; Commentary:
 ;; Require this entry point, or explicitly load its .el during development.
 ;; Modules own their implementations; this file installs reversible keys and
-;; action-history advice only.  Native Kubed refresh/actions remain native.
+;; action-history and context-validation advice.  Native Kubed refresh/actions
+;; remain native; invalid contexts never reach native process creation.
 ;;; Code:
 (require 'kubed)
 (require 'transient)
@@ -35,6 +36,24 @@ so cleanup never restores into a replacement map installed by the user."
           kubed-ext--installed-bindings)
     (define-key map (kbd key) command)))
 
+(defun kubed-ext--native-context (context)
+  "Return native CONTEXT, recovering a missing default from kubeconfig.
+Run as return-value advice on `kubed-local-context', before native namespace
+completion.  Do not change explicit contexts or Kubed's environment cache."
+  (if (and (stringp context) (not (string-blank-p context)))
+      context
+    (let ((current (kubed-current-context)))
+      (unless (and (stringp current) (not (string-blank-p current)))
+        (user-error "No Kubernetes context configured; select one with kubectl config use-context"))
+      current)))
+
+(defun kubed-ext--validate-native-update (_type context &rest _args)
+  "Reject invalid native update CONTEXT before buffers or processes are made.
+The remaining arguments, including Kubed's execution-environment key, are
+untouched.  This is before-advice, not an update implementation override."
+  (unless (and (stringp context) (not (string-blank-p context)))
+    (user-error "No Kubernetes context selected; use kubed-use-context first")))
+
 (defun kubed-ext--record-action-command (&rest _args)
   "Record the argv produced by the action module, never shell process traffic."
   (when kubed-ext--last-action-command
@@ -57,6 +76,8 @@ changes survive.  Each owner is attempted even if another cleanup fails."
         (define-key map (kbd key) old))))
   (setq kubed-ext--installed-bindings nil)
   (advice-remove 'kubed-ext--action-run #'kubed-ext--record-action-command)
+  (advice-remove 'kubed-local-context #'kubed-ext--native-context)
+  (advice-remove 'kubed-update #'kubed-ext--validate-native-update)
   ;; Keep the guard across ALL owners, including process deletion sentinels.
   (let ((kubed-ext--unloading t))
     (dolist (cleanup '(kubed-ext--cancel-all-requests kubed-ext-resources-stop-all
@@ -326,6 +347,8 @@ resource-module marking/filter/refresh keys without overriding their functions."
     (kubed-ext--install-binding kubed-ext-resources-mode-map
                                 (car binding) (cdr binding)))
   (advice-add 'kubed-ext--action-run :after #'kubed-ext--record-action-command)
+  (advice-add 'kubed-local-context :filter-return #'kubed-ext--native-context)
+  (advice-add 'kubed-update :before #'kubed-ext--validate-native-update)
   t)
 
 (kubed-ext-setup)
