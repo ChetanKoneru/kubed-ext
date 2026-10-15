@@ -1,0 +1,141 @@
+;;; kubed-ext-core-test.el --- Transport regressions -*- lexical-binding: t; -*-
+;;; Code:
+(require 'ert)
+(require 'kubed-ext-core)
+(defvar kubed-ext-core-test-local nil)
+(defun kubed-ext-core-test-wait (request)
+  "Wait at most three seconds for local REQUEST completion."
+  (let ((deadline (+ (float-time) 3)))
+    (while (and (not (kubed-ext-request-finished-p request))
+                (< (float-time) deadline))
+      (accept-process-output nil 0.02)))
+  (should (kubed-ext-request-finished-p request)))
+(ert-deftest kubed-ext-core-environment-is-dynamic ()
+  "Callbacks restore locals without persisting changes in unrelated buffers."
+  (let ((kubed-execution-environment-buffer-locals
+         '(process-environment exec-path kubed-ext-core-test-local)) snapshot)
+    (with-temp-buffer
+      (setq-local kubed-ext-core-test-local '(origin))
+      (setq snapshot (kubed-ext--capture-environment)))
+    (with-temp-buffer
+      (setq-local kubed-ext-core-test-local '(destination))
+      (kubed-ext--with-environment snapshot
+        (should (equal kubed-ext-core-test-local '(origin))))
+      (should (equal kubed-ext-core-test-local '(destination))))))
+(ert-deftest kubed-ext-core-environment-evaluated-once ()
+  "Environment forms run once and new buffers can opt into persistence."
+  (let ((calls 0) (snapshot (kubed-ext--capture-environment)))
+    (kubed-ext--with-environment (progn (cl-incf calls) snapshot) t)
+    (should (= calls 1))
+    (with-temp-buffer
+      (kubed-ext--apply-environment-to-new-buffer snapshot)
+      (should (local-variable-p 'process-environment)))))
+(ert-deftest kubed-ext-core-real-outcomes ()
+  "Success, stderr and callback exceptions release owned resources."
+  (let ((kubed-ext--requests nil) (kubed-ext--request-queue nil)
+        (kubed-ext--unloading nil) (kubed-ext-request-timeout 2) result errors)
+    (dolist (command '("printf hello" "printf bad >&2; exit 7" "kill -TERM $$"))
+      (let ((request (kubed-ext--async-kubectl
+                      (list "/bin/sh" "-c" command)
+                      (lambda (text) (push text result))
+                      (lambda (text) (push text errors)))))
+        (should (kubed-ext-request-p request))
+        (kubed-ext-core-test-wait request)
+        (should-not (buffer-live-p (kubed-ext-request-stdout-buffer request)))
+        (should-not (process-live-p (kubed-ext-request-process request)))))
+    (should (equal result '("hello")))
+    (should (= (length errors) 2))
+    (let ((request (kubed-ext--async-kubectl '("/bin/sh" "-c" "true")
+                     (lambda (_) (error "Test callback")))))
+      (kubed-ext-core-test-wait request))
+    (should-not kubed-ext--requests)))
+(ert-deftest kubed-ext-core-timeout-cancel-shutdown ()
+  "Timeout kills processes; cancellation and shutdown suppress callbacks."
+  (let ((kubed-ext--requests nil) (kubed-ext--request-queue nil)
+        (kubed-ext--unloading nil) (kubed-ext-shutdown-hook nil)
+        (kubed-ext-request-timeout 0.05)
+        (kubed-ext-request-concurrency 1) (calls 0))
+    (let ((request (kubed-ext--async-kubectl '("/bin/sh" "-c" "exec sleep 5")
+                     (lambda (_) (cl-incf calls))
+                     (lambda (_) (cl-incf calls)))))
+      (kubed-ext-core-test-wait request)
+      (should-not (process-live-p (kubed-ext-request-process request)))
+      (should (= calls 1)))
+    (let* ((a (kubed-ext--async-kubectl '("/bin/sh" "-c" "exec sleep 5") #'ignore))
+           (b (kubed-ext--async-kubectl '("/bin/sh" "-c" "true")
+                (lambda (_) (cl-incf calls)))))
+      (should-not (kubed-ext-request-process b))
+      (kubed-ext-cancel-request b)
+      (kubed-ext--cancel-all-requests)
+      (should (kubed-ext-request-finished-p a))
+      (should-not kubed-ext--requests)
+      (should-not kubed-ext--request-queue)
+      (should (= calls 1)))))
+(ert-deftest kubed-ext-core-validates-bounds ()
+  "Reject invalid configuration rather than freezing or creating unbounded work."
+  (dolist (value '(0 -1 1.5 "4"))
+    (let ((kubed-ext-request-concurrency value))
+      (should-error (kubed-ext--async-kubectl '("/bin/sh" "-c" "true") #'ignore))))
+  (let ((kubed-ext-request-timeout 0))
+    (should-error (kubed-ext--async-kubectl '("/bin/sh" "-c" "true") #'ignore)))
+  (let ((kubed-ext--requests nil) (kubed-ext--request-queue nil)
+        (kubed-ext--unloading nil) (kubed-ext-shutdown-hook nil)
+        (kubed-ext-request-concurrency 1) (kubed-ext-request-queue-limit 1))
+    (unwind-protect
+        (progn
+          (kubed-ext--async-kubectl '("/bin/sh" "-c" "exec sleep 5") #'ignore)
+          (kubed-ext--async-kubectl '("/bin/sh" "-c" "true") #'ignore)
+          (should-error (kubed-ext--async-kubectl '("/bin/sh" "-c" "true") #'ignore)))
+      (kubed-ext--cancel-all-requests))))
+(ert-deftest kubed-ext-core-scope-contract ()
+  "Scope flags preserve context, namespace and explicit all-namespace intent."
+  (should (equal (kubed-ext--scope-args '(:context "c" :namespace "n"))
+                 '("--context=c" "--namespace=n")))
+  (should (equal (kubed-ext--scope-args '(:context "c" :all-namespaces t))
+                 '("--context=c" "-A"))))
+(ert-deftest kubed-ext-core-unbound-and-executable ()
+  "Unbound configured symbols stay unbound; captured executable is authoritative."
+  (let ((kubed-execution-environment-buffer-locals
+         '(kubed-ext-core-test-unbound process-environment)) snapshot)
+    (makunbound 'kubed-ext-core-test-unbound)
+    (setq snapshot (kubed-ext--capture-environment))
+    (setq snapshot (plist-put snapshot :kubectl "/captured/kubectl"))
+    (with-temp-buffer
+      (set (make-local-variable 'kubed-ext-core-test-unbound) 'destination)
+      (kubed-ext--with-environment snapshot
+        (should-not (boundp 'kubed-ext-core-test-unbound))
+        (should (equal (kubed-ext--kubectl-program) "/captured/kubectl")))
+      (should (eq (symbol-value 'kubed-ext-core-test-unbound) 'destination)))))
+(ert-deftest kubed-ext-core-fifo-spawn-failure-no-recursion ()
+  "FIFO remains bounded and drains many synchronous failures without recursion."
+  (let ((kubed-ext--requests nil) (kubed-ext--request-queue nil)
+        (kubed-ext--unloading nil) (kubed-ext--draining t)
+        (kubed-ext-request-concurrency 1) (kubed-ext-request-queue-limit 300)
+        (max-lisp-eval-depth 200) (calls 0) seen)
+    (dotimes (index 250)
+      (kubed-ext--async-kubectl '("/definitely/not/a/program") #'ignore
+                                (lambda (_) (push index seen) (cl-incf calls))))
+    (let ((kubed-ext--draining nil)) (kubed-ext--start-queued-requests))
+    (should (= calls 250))
+    (should (equal (nreverse seen) (number-sequence 0 249)))
+    (should-not kubed-ext--requests)
+    (should-not kubed-ext--request-queue)))
+(ert-deftest kubed-ext-core-process-file-handler-contract ()
+  "Every process launch opts into handlers and preserves full argv."
+  (let ((original (symbol-function 'make-process)) captured
+        (kubed-ext--requests nil) (kubed-ext--request-queue nil))
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args) (setq captured args) (apply original args))))
+      (let ((request (kubed-ext--async-kubectl '("/bin/sh" "-c" "printf ok") #'ignore)))
+        (kubed-ext-core-test-wait request)
+        (should (eq (plist-get captured :file-handler) t))
+        (should (equal (plist-get captured :command) '("/bin/sh" "-c" "printf ok")))))))
+(ert-deftest kubed-ext-core-reload-guard-discards-stale-registry ()
+  "Reload cleanup discards registry entries without reading their struct slots."
+  (let ((kubed-ext--requests '(obsolete-request))
+        (kubed-ext--request-queue '(obsolete-request)))
+    (kubed-ext--reset-transport-after-reload)
+    (should-not kubed-ext--requests)
+    (should-not kubed-ext--request-queue)))
+(provide 'kubed-ext-core-test)
+;;; kubed-ext-core-test.el ends here
