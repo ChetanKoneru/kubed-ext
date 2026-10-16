@@ -96,6 +96,14 @@ ownership is recovered only from extension-named runtime objects."
   argv success error environment process stdout-buffer stderr-buffer timer
   finished completing cancelled failure started (bytes 0))
 
+(defun kubed-ext--environment-identity ()
+  "Return Kubed's execution-environment key, or a remote-host fallback.
+Kubed 0.7.1 keys cached connections by this value; later checkouts drop the
+function, in which case the remote host alone identifies the environment."
+  (if (fboundp 'kubed-execution-environment-key)
+      (kubed-execution-environment-key)
+    (file-remote-p default-directory)))
+
 (defun kubed-ext--capture-environment ()
   "Snapshot executable, directory, configured Kubed locals and environment key.
 Unbound configured variables remain unbound under temporary restoration."
@@ -108,7 +116,8 @@ Unbound configured variables remain unbound under temporary restoration."
                                 kubed-execution-environment-key-function
                                 connection-local-profile-alist
                                 connection-local-criteria-alist)
-                             kubed-execution-environment-buffer-locals)))
+                             (and (boundp 'kubed-execution-environment-buffer-locals)
+                                  (symbol-value 'kubed-execution-environment-buffer-locals)))))
          (locals (mapcar (lambda (var)
                            (cons var (and (boundp var)
                                           (copy-tree (symbol-value var) t))))
@@ -119,7 +128,7 @@ Unbound configured variables remain unbound under temporary restoration."
           :exec-path (copy-sequence exec-path)
           :kubectl (kubed-ext--kubectl-program)
           :locals locals :unbound (cl-remove-if #'boundp variables)
-          :eenv (copy-tree (kubed-execution-environment-key) t))))
+          :eenv (copy-tree (kubed-ext--environment-identity) t))))
 
 (defmacro kubed-ext--with-environment (environment &rest body)
   "Evaluate BODY with temporary dynamic bindings from ENVIRONMENT.
@@ -176,8 +185,10 @@ Honor Kubed 0.7.1's environment cache and host-configured valid defaults."
         (kubed-ext--with-environment environment (funcall callback scope))
       (kubed-ext--with-environment environment
         (let ((configured (copy-tree
-                           (or (alist-get (plist-get environment :eenv)
-                                          kubed--context-and-namespace-alist nil nil #'equal)
+                           (or (and (boundp 'kubed--context-and-namespace-alist)
+                                    (alist-get (plist-get environment :eenv)
+                                               (symbol-value 'kubed--context-and-namespace-alist)
+                                               nil nil #'equal))
                                (alist-get (file-remote-p default-directory)
                                           kubed-default-context-and-namespace-alist nil nil #'equal)))))
           (kubed-ext--async-kubectl
