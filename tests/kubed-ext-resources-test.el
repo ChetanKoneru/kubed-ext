@@ -72,7 +72,7 @@
     (let ((kubed-ext-resource-retain-limit 5)
           (kubed-ext-resource-parse-batch-size 6000)
           jobs result)
-      (cl-letf (((symbol-function 'run-with-idle-timer)
+      (cl-letf (((symbol-function 'run-with-timer)
                  (lambda (_delay _repeat fn &rest args) (push (cons fn args) jobs))))
         (kubed-ext--parse-table-async
          (concat "NAMESPACE   NAME\n"
@@ -258,5 +258,116 @@
     (kubed-ext--replace-crd-entries "c" environment entries)
     (kubed-ext--write-crd-cache "c" environment entries)
     (should (kubed-ext-crd-metadata "things.example.io" "c" environment))))
+(ert-deftest kubed-ext-resources-completion-cache-is-async-and-deduplicated ()
+  "Context and namespace prompts complete from an asynchronously filled cache."
+  (let ((kubed-ext--contexts-cache (make-hash-table :test 'equal))
+        (kubed-ext--namespaces-cache (make-hash-table :test 'equal))
+        (kubed-ext--completion-requests (make-hash-table :test 'equal))
+        (environment (kubed-ext--capture-environment))
+        argvs)
+    (cl-letf (((symbol-function 'kubed-ext--async-kubectl)
+               (lambda (argv success &rest _)
+                 (push argv argvs)
+                 ;; Reply later, as a real request does.
+                 (list :success success))))
+      (kubed-ext-contexts-async environment)
+      ;; A second request for the same key must not spawn another process.
+      (kubed-ext-contexts-async environment)
+      (should (= (length argvs) 1))
+      (should (equal (cdr (car argvs)) '("config" "get-contexts" "-o" "name")))
+      (let ((table (kubed-ext--cached-completion-table
+                    'kubed-ext--contexts-cache (kubed-ext--environment-key environment))))
+        ;; Nothing has arrived yet: the prompt still works, with no candidates.
+        (should-not (all-completions "" table))
+        (funcall (plist-get (gethash (list 'kubed-ext--contexts-cache
+                                           (kubed-ext--environment-key environment))
+                                     kubed-ext--completion-requests)
+                            :success)
+                 "alpha\nbeta\n")
+        ;; The same table now sees the names, without reopening the prompt.
+        (should (equal (all-completions "" table) '("alpha" "beta")))))))
+
+(ert-deftest kubed-ext-resources-namespace-completion-is-context-scoped ()
+  "Namespace candidates are requested and cached per context."
+  (let ((kubed-ext--namespaces-cache (make-hash-table :test 'equal))
+        (kubed-ext--completion-requests (make-hash-table :test 'equal))
+        (environment (kubed-ext--capture-environment))
+        argv)
+    (cl-letf (((symbol-function 'kubed-ext--async-kubectl)
+               (lambda (command success &rest _) (setq argv command) (list :success success))))
+      (kubed-ext-namespaces-async "c" environment)
+      (should (member "--context=c" argv))
+      (should (member "namespaces" argv))
+      (funcall (plist-get (gethash (list 'kubed-ext--namespaces-cache
+                                         (kubed-ext--crd-context-key "c" environment))
+                                   kubed-ext--completion-requests)
+                          :success)
+               "kube-system\nprod\n")
+      (should (equal (gethash (kubed-ext--crd-context-key "c" environment)
+                              kubed-ext--namespaces-cache)
+                     '("kube-system" "prod")))
+      ;; A different context does not inherit those candidates.
+      (should-not (gethash (kubed-ext--crd-context-key "other" environment)
+                           kubed-ext--namespaces-cache)))))
+
+(ert-deftest kubed-ext-resources-hidden-columns-keep-cells-aligned ()
+  "Hidden columns are dropped from headers and every row together."
+  (let ((kubed-ext-resource-hidden-columns '("nominated node" "READINESS GATES")))
+    (should (equal (kubed-ext--visible-columns
+                    '("NAME" "AGE" "NODE" "NOMINATED NODE" "READINESS GATES")
+                    '(("p" "8d" "n1" "<none>" "<none>")))
+                   '(("NAME" "AGE" "NODE") ("p" "8d" "n1")))))
+  ;; Identity columns are never hidden, whatever the user configures.
+  (let ((kubed-ext-resource-hidden-columns '("NAME" "NAMESPACE" "AGE")))
+    (should (equal (car (kubed-ext--visible-columns '("NAMESPACE" "NAME" "AGE") nil))
+                   '("NAMESPACE" "NAME")))))
+
+(ert-deftest kubed-ext-resources-wide-output-is-requested-and-toggleable ()
+  "Wide columns are an explicit kubectl flag, toggled per view."
+  (with-temp-buffer
+    (kubed-ext-resources-mode)
+    (setq kubed-ext--view-scope '(:type "pods" :context "c" :namespace "n" :wide t))
+    (should (member "-o" (kubed-ext--resource-list-argv kubed-ext--view-scope)))
+    (should (member "wide" (kubed-ext--resource-list-argv kubed-ext--view-scope)))
+    (setq kubed-ext--view-wide t)
+    (cl-letf (((symbol-function 'kubed-ext-refresh-resources) #'ignore))
+      (kubed-ext-toggle-wide-output))
+    (should-not kubed-ext--view-wide)
+    (should-not (member "wide" (kubed-ext--resource-list-argv kubed-ext--view-scope)))))
+
+(ert-deftest kubed-ext-resources-completion-spawn-failure-unblocks-key ()
+  "A synchronous spawn failure must not leave a key permanently inflight."
+  (let ((kubed-ext--contexts-cache (make-hash-table :test 'equal))
+        (kubed-ext--completion-requests (make-hash-table :test 'equal))
+        (environment (kubed-ext--capture-environment))
+        (calls 0))
+    (cl-letf (((symbol-function 'kubed-ext--async-kubectl)
+               (lambda (_argv _success &optional error)
+                 (cl-incf calls)
+                 ;; The transport reports spawn failure before returning.
+                 (when error (funcall error "process exited 1"))
+                 (kubed-ext--make-request :argv '("kubectl") :finished t))))
+      (kubed-ext-contexts-async environment)
+      (should (zerop (hash-table-count kubed-ext--completion-requests)))
+      ;; The key is free, so a later attempt really retries.
+      (kubed-ext-contexts-async environment)
+      (should (= calls 2)))))
+
+(ert-deftest kubed-ext-resources-stop-all-releases-completion-requests ()
+  "Shutdown cancels completion requests and frees their keys."
+  (let ((kubed-ext--completion-requests (make-hash-table :test 'equal))
+        (kubed-ext--crd-discovery-state (make-hash-table :test 'equal))
+        (environment (kubed-ext--capture-environment))
+        cancelled)
+    (cl-letf (((symbol-function 'kubed-ext--async-kubectl)
+               (lambda (&rest _) (kubed-ext--make-request :argv '("kubectl"))))
+              ((symbol-function 'kubed-ext-cancel-request)
+               (lambda (request) (push request cancelled))))
+      (kubed-ext-contexts-async environment)
+      (should (= (hash-table-count kubed-ext--completion-requests) 1))
+      (kubed-ext-resources-stop-all)
+      (should (= (length cancelled) 1))
+      (should (zerop (hash-table-count kubed-ext--completion-requests))))))
+
 (provide 'kubed-ext-resources-test)
 ;;; kubed-ext-resources-test.el ends here

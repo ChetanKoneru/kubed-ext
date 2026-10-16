@@ -90,13 +90,20 @@
   (with-temp-buffer
     (kubed-ext-resources-mode)
     (setq kubed-ext--view-scope '(:type "deployments" :context "old" :namespace "ns" :selector "app=api"))
-    (let (args)
-      (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "new"))
+    (let (args prompts)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (prompt &rest _) (push prompt prompts) "new"))
+                ;; Completion candidates arrive asynchronously; prompting must
+                ;; never wait for them.
+                ((symbol-function 'kubed-ext--async-kubectl)
+                 (lambda (&rest _) (ert-fail "Blocking discovery during prompt")))
                 ((symbol-function 'kubed-ext-list-resources) (lambda (&rest a) (setq args a))))
         (call-interactively #'kubed-ext-switch-context)
         (should (equal args '("deployments" "new" "ns" "app=api")))
         (call-interactively #'kubed-ext-switch-namespace)
-        (should (equal args '("deployments" "old" "new" "app=api")))))))
+        (should (equal args '("deployments" "old" "new" "app=api")))
+        ;; Both prompts offer the current value as the minibuffer default.
+        (should (= (length prompts) 2))))))
 
 (ert-deftest kubed-ext-entry-selected-workload-logs-use-true-signature ()
   "Menu logs call Stern with type/name/context/namespace, not hardcoded pods."
@@ -235,6 +242,42 @@
                               kubed-ext-metrics kubed-ext-terminals))
               (should (featurep feature))))
         (advice-remove 'kubed-ext--action-run advice)))))
+
+(defun kubed-ext-test--menu-entries ()
+  "Return (KEY DESCRIPTION COMMAND) for every suffix of the transient menu."
+  (let (entries)
+    (dolist (group (append (get 'kubed-ext-transient-menu 'transient--layout) nil))
+      (dolist (column (append (if (vectorp group) (aref group 3) nil) nil))
+        (dolist (suffix (append (if (vectorp column) (aref column 3) nil) nil))
+          (let ((plist (and (vectorp suffix) (aref suffix 2))))
+            (when (plist-get plist :key)
+              (push (list (plist-get plist :key)
+                          (plist-get plist :description)
+                          (plist-get plist :command))
+                    entries))))))
+    (nreverse entries)))
+
+(ert-deftest kubed-ext-entry-menu-keys-are-unique ()
+  "No two menu entries may claim the same key."
+  (let* ((keys (mapcar #'car (kubed-ext-test--menu-entries)))
+         (duplicates (cl-remove-if-not (lambda (k) (> (cl-count k keys :test #'equal) 1))
+                                       (delete-dups (copy-sequence keys)))))
+    (should (equal duplicates nil))))
+
+(ert-deftest kubed-ext-entry-menu-commands-have-direct-keys ()
+  "Every row or table command in the menu is reachable without the menu."
+  (kubed-ext-setup)
+  (let ((maps (list kubed-ext-resources-mode-map kubed-ext-pods-mode-map
+                    kubed-ext-log-mode-map))
+        ;; Menu-only entries: closing the menu, disabling the package, and the
+        ;; refresh dispatcher, which each table binds to its own `g'.
+        (exempt '(transient-quit-one kubed-ext-disable kubed-ext-refresh))
+        missing)
+    (pcase-dolist (`(,_key ,_description ,command) (kubed-ext-test--menu-entries))
+      (when (and command (not (memq command exempt))
+                 (not (seq-some (lambda (map) (where-is-internal command map t)) maps)))
+        (push command missing)))
+    (should (equal missing nil))))
 
 (provide 'kubed-ext-test)
 ;;; kubed-ext-test.el ends here

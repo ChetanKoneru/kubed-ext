@@ -185,7 +185,7 @@
     (kubed-ext-resources-mode)
     (let ((kubed-ext-resource-retain-limit 5) (kubed-ext-resource-parse-batch-size 2)
           jobs result (turns 0))
-      (cl-letf (((symbol-function 'run-with-idle-timer)
+      (cl-letf (((symbol-function 'run-with-timer)
                  (lambda (_delay _repeat fn &rest args) (push (cons fn args) jobs))))
         (kubed-ext--parse-table-async
          (concat "NAME   METADATA STATE\n"
