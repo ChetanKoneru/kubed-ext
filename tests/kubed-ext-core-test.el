@@ -137,5 +137,32 @@
     (kubed-ext--reset-transport-after-reload)
     (should-not kubed-ext--requests)
     (should-not kubed-ext--request-queue)))
+(ert-deftest kubed-ext-core-tolerates-missing-execution-environment-api ()
+  "Capture must work against a Kubed without the 0.7.1 environment API."
+  (let ((key (and (fboundp 'kubed-execution-environment-key)
+                  (symbol-function 'kubed-execution-environment-key)))
+        (locals (and (boundp 'kubed-execution-environment-buffer-locals)
+                     (symbol-value 'kubed-execution-environment-buffer-locals)))
+        (alist (and (boundp 'kubed--context-and-namespace-alist)
+                    (symbol-value 'kubed--context-and-namespace-alist))))
+    (unwind-protect
+        (progn
+          (when key (fmakunbound 'kubed-execution-environment-key))
+          (when locals (makunbound 'kubed-execution-environment-buffer-locals))
+          (when alist (makunbound 'kubed--context-and-namespace-alist))
+          (let ((environment (kubed-ext--capture-environment)))
+            (should environment)
+            (should (plist-get environment :kubectl))
+            ;; The remote host identifies the environment in place of the key.
+            (should (equal (plist-get environment :eenv)
+                           (file-remote-p default-directory)))
+            ;; Bindings still restore cleanly from that snapshot.
+            (should (equal (kubed-ext--with-environment environment
+                             (kubed-ext--kubectl-program))
+                           (plist-get environment :kubectl)))))
+      (when key (fset 'kubed-execution-environment-key key))
+      (when locals (set 'kubed-execution-environment-buffer-locals locals))
+      (when alist (set 'kubed--context-and-namespace-alist alist)))))
+
 (provide 'kubed-ext-core-test)
 ;;; kubed-ext-core-test.el ends here
