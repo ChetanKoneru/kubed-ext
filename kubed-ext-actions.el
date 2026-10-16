@@ -9,6 +9,69 @@
 
 (defcustom kubed-ext-output-format "yaml" "Resource output format."
   :type '(choice (const "yaml") (const "json")) :group 'kubed-ext)
+
+(defcustom kubed-ext-highlight-output t
+  "Syntax-highlight resource output instead of showing it as plain text."
+  :type 'boolean :group 'kubed-ext)
+
+(defcustom kubed-ext-highlight-describe t
+  "Highlight `kubectl describe' output with the YAML mode.
+Describe output is not YAML, but its indented key/value shape highlights
+closely enough to be useful."
+  :type 'boolean :group 'kubed-ext)
+
+(defcustom kubed-ext-yaml-modes '(yaml-ts-mode yaml-mode)
+  "Major modes tried for YAML output, most preferred first.
+Tree-sitter modes are skipped when their grammar is unavailable."
+  :type '(repeat symbol) :group 'kubed-ext)
+
+(defcustom kubed-ext-json-modes '(json-ts-mode json-mode js-json-mode)
+  "Major modes tried for JSON output, most preferred first.
+Tree-sitter modes are skipped when their grammar is unavailable."
+  :type '(repeat symbol) :group 'kubed-ext)
+
+(defvar-local kubed-ext--output-mode nil
+  "Major mode chosen for this output buffer, or nil for plain text.")
+
+(defvar kubed-ext-output-mode-map
+  (let ((map (make-sparse-keymap)))
+    (keymap-set map "q" #'quit-window)
+    map)
+  "Keys added to highlighted output buffers, which are not `special-mode'.")
+
+(defun kubed-ext--output-mode-for (format)
+  "Return an available major mode for FORMAT, or nil to keep plain text.
+FORMAT is `yaml', `json' or `describe'."
+  (when kubed-ext-highlight-output
+    (let ((candidates (pcase format
+                        ("json" kubed-ext-json-modes)
+                        ("yaml" kubed-ext-yaml-modes)
+                        ("describe" (and kubed-ext-highlight-describe
+                                         kubed-ext-yaml-modes)))))
+      (seq-find (lambda (mode)
+                  (and (fboundp mode)
+                       ;; A tree-sitter mode without its grammar fails loudly.
+                       (or (not (string-suffix-p "-ts-mode" (symbol-name mode)))
+                           (and (fboundp 'treesit-ready-p)
+                                (treesit-ready-p
+                                 (intern (string-remove-suffix
+                                          "-ts-mode" (symbol-name mode)))
+                                 t)))))
+                candidates))))
+
+(defun kubed-ext--apply-output-mode (format)
+  "Prepare the current buffer to display FORMAT output.
+Fall back to `special-mode' when no highlighting mode is available.  The
+major mode is selected before any buffer-local state is stored, because
+changing it afterwards would discard that state."
+  (let ((mode (kubed-ext--output-mode-for format)))
+    (if (not mode)
+        (unless (derived-mode-p 'special-mode) (special-mode))
+      (unless (eq major-mode mode) (funcall mode))
+      (setq buffer-read-only t)
+      (use-local-map (make-composed-keymap kubed-ext-output-mode-map
+                                           (current-local-map))))
+    (setq-local kubed-ext--output-mode mode)))
 (defcustom kubed-ext-port-forward-address "::1" "Port-forward bind address."
   :type 'string :group 'kubed-ext)
 (defvar kubed-ext--port-forwards nil "Owned forwarding session plists.")
@@ -94,8 +157,10 @@
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (let ((inhibit-read-only t))
-          (unless (derived-mode-p 'special-mode) (special-mode))
+          (unless (or kubed-ext--output-mode (derived-mode-p 'special-mode))
+            (special-mode))
           (erase-buffer) (insert (or output ""))
+          (when kubed-ext--output-mode (font-lock-ensure))
           (setq header-line-format
                 (concat (if failure "Request failed — " "Request complete — ")
                         (kubed-ext--scope-label kubed-ext--action-scope)))))
@@ -146,7 +211,9 @@
       (user-error "An explicit context is required for mutation"))
     (setq kubed-ext--last-action-command argv)
     (with-current-buffer buffer
-      (if (equal (car arguments) "rollout") (kubed-ext-rollout-history-mode) (special-mode))
+      (if (equal (car arguments) "rollout")
+          (kubed-ext-rollout-history-mode)
+        (kubed-ext--apply-output-mode (car arguments)))
       (kubed-ext--apply-environment-to-new-buffer environment)
       (setq-local kubed-ext--action-scope scope
                   kubed-ext--action-environment environment
@@ -183,7 +250,7 @@
        (let* ((environment (plist-get resolved :environment))
               (buffer (kubed-ext--action-output-buffer (format "%s %s" format (kubed-ext--scope-label resolved)))))
          (with-current-buffer buffer
-           (special-mode)
+           (kubed-ext--apply-output-mode format)
            (kubed-ext--apply-environment-to-new-buffer environment)
            (setq-local kubed-ext--action-scope resolved kubed-ext--action-environment environment
                        header-line-format "Request pending"))
