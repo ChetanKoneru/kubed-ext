@@ -279,5 +279,53 @@
         (push command missing)))
     (should (equal missing nil))))
 
+(defmacro kubed-ext-test--with-native-map (&rest body)
+  "Evaluate BODY with a pristine `kubed-list-mode-map' and no owned bindings.
+Extension keys left by an earlier test are stripped, so the policy under
+test is observed from Kubed's own bindings alone."
+  `(let ((kubed-list-mode-map (copy-keymap kubed-list-mode-map))
+         (kubed-ext--installed-bindings nil))
+     (map-keymap (lambda (key command)
+                   (when (and (symbolp command)
+                              (string-prefix-p "kubed-ext-" (symbol-name command)))
+                     (define-key kubed-list-mode-map (vector key) nil)))
+                 kubed-list-mode-map)
+     ,@body))
+
+(ert-deftest kubed-ext-entry-native-free-keys-never-shadow ()
+  "The default policy adds keys to native lists without replacing any."
+  (kubed-ext-test--with-native-map
+   (let ((kubed-ext-native-list-keys 'free)
+         (before (list (cons "d" (keymap-lookup kubed-list-mode-map "d"))
+                       (cons "e" (keymap-lookup kubed-list-mode-map "e"))
+                       (cons "!" (keymap-lookup kubed-list-mode-map "!"))
+                       (cons "RET" (keymap-lookup kubed-list-mode-map "RET")))))
+     (kubed-ext-setup)
+     ;; Keys Kubed owns keep their native command.
+     (pcase-dolist (`(,key . ,command) before)
+       (should (eq (keymap-lookup kubed-list-mode-map key) command)))
+     ;; Keys Kubed leaves free now reach the extension.
+     (should (eq (keymap-lookup kubed-list-mode-map "r") #'kubed-ext-switch-resource))
+     (should (eq (keymap-lookup kubed-list-mode-map "c") #'kubed-ext-switch-context))
+     (should (eq (keymap-lookup kubed-list-mode-map "v") #'kubed-ext-vterm-pod)))))
+
+(ert-deftest kubed-ext-entry-native-all-keys-shadow-and-restore ()
+  "The `all' policy shadows native keys and `kubed-ext-disable' restores them."
+  (kubed-ext-test--with-native-map
+   (let ((kubed-ext-native-list-keys 'all)
+         (native-d (keymap-lookup kubed-list-mode-map "d")))
+     (kubed-ext-setup)
+     (should (eq (keymap-lookup kubed-list-mode-map "d") #'kubed-ext-describe-resource))
+     (kubed-ext-disable)
+     (should (eq (keymap-lookup kubed-list-mode-map "d") native-d)))))
+
+(ert-deftest kubed-ext-entry-native-keys-can-be-declined ()
+  "A nil policy leaves native lists with the menu key alone."
+  (kubed-ext-test--with-native-map
+   (let ((kubed-ext-native-list-keys nil))
+     (kubed-ext-setup)
+     (should-not (keymap-lookup kubed-list-mode-map "r"))
+     (should (eq (keymap-lookup kubed-list-mode-map "?") #'kubed-ext-transient-menu)))))
+
 (provide 'kubed-ext-test)
 ;;; kubed-ext-test.el ends here
