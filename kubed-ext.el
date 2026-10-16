@@ -19,6 +19,7 @@
 (require 'kubed-ext-actions)
 (require 'kubed-ext-metrics)
 (require 'kubed-ext-terminals)
+(require 'kubed-ext-pods)
 
 (defvar kubed-ext--installed-bindings nil
   "Owned binding snapshots: (MAP KEY ORIGINAL INSTALLED).")
@@ -101,7 +102,7 @@ changes survive.  Each owner is attempted even if another cleanup fails."
 
 (defun kubed-ext--resource-view-p ()
   "Return non-nil in a native or enhanced resource list."
-  (derived-mode-p 'kubed-list-mode 'kubed-ext-resources-mode))
+  (derived-mode-p 'kubed-list-mode 'kubed-ext-resources-mode 'kubed-ext-pods-mode))
 (defun kubed-ext--enhanced-view-p ()
   "Return non-nil in an enhanced resource list."
   (derived-mode-p 'kubed-ext-resources-mode))
@@ -144,7 +145,8 @@ changes survive.  Each owner is attempted even if another cleanup fails."
 (defun kubed-ext-refresh ()
   "Refresh the current enhanced/native/resource/log/metric workflow."
   (interactive)
-  (cond ((kubed-ext--enhanced-view-p) (kubed-ext-refresh-resources))
+  (cond ((derived-mode-p 'kubed-ext-pods-mode) (kubed-ext-pods-refresh))
+        ((kubed-ext--enhanced-view-p) (kubed-ext-refresh-resources))
         ((derived-mode-p 'kubed-list-mode) (call-interactively #'kubed-list-update))
         ((derived-mode-p 'kubed-ext-top-mode) (kubed-ext-top-refresh))
         ((kubed-ext--log-view-p) (kubed-ext-restart-logs))
@@ -223,8 +225,15 @@ recorded.  Commands are shell-quoted for copying, never executed here."
           (insert (mapconcat #'shell-quote-argument argv " ") "\n"))))
     (pop-to-buffer buffer)))
 
-(defalias 'kubed-ext-list-ingresss #'kubed-list-ingresses)
-(defalias 'kubed-ext-list-ingressclasss #'kubed-list-ingressclasses)
+;; Native Kubed's ingress list shows only CLASS and a creation timestamp.  The
+;; enhanced list uses the server's own table, which carries HOSTS, ADDRESS,
+;; PORTS and AGE, so these entry points open that instead.
+(defun kubed-ext-list-ingresss ()
+  "List ingresses with server HOSTS, ADDRESS, PORTS and AGE columns."
+  (interactive) (kubed-ext--jump-resource "ingresses"))
+(defun kubed-ext-list-ingressclasss ()
+  "List ingress classes with the server's own columns."
+  (interactive) (kubed-ext--jump-resource "ingressclasses"))
 
 (defun kubed-ext--jump-resource (type)
   "Open enhanced TYPE preserving current context, namespace and selector."
@@ -288,7 +297,9 @@ recorded.  Commands are shell-quoted for copying, never executed here."
     ("/" "Literal filter" kubed-ext-set-filter :if kubed-ext--enhanced-view-p)
     ("L" "Server label selector" kubed-ext-list-set-label-selector :if kubed-ext--resource-view-p)
     ("a" "Auto-refresh" kubed-ext-auto-refresh-mode :if kubed-ext--enhanced-view-p)
+    ("w" "Wide columns (NODE/IP)" kubed-ext-toggle-wide-output :if kubed-ext--enhanced-view-p)
     ("p" "Pod metrics" kubed-ext-view-top-pods :if kubed-ext--resource-view-p)
+    ("W" "Pods + usage table" kubed-ext-list-pods)
     ("N" "Node metrics" kubed-ext-view-top-nodes :if kubed-ext--resource-view-p)
     ("C" "Refresh CRD metadata" kubed-ext-refresh-crd-columns :if kubed-ext--resource-view-p)]
    ["Selected row"
@@ -303,6 +314,9 @@ recorded.  Commands are shell-quoted for copying, never executed here."
     ("D" "Delete (confirm)" kubed-ext-delete-resource :if kubed-ext--row-selected-p)]
    ["Pod / Strimzi"
     ("v" "vterm" kubed-ext-vterm-pod :if kubed-ext--pod-selected-p)
+    ("G" "ghostel" kubed-ext-ghostel-pod :if kubed-ext--pod-selected-p)
+    ("A" "eat" kubed-ext-eat-pod :if kubed-ext--pod-selected-p)
+    ("T" "ansi-term" kubed-ext-ansi-term-pod :if kubed-ext--pod-selected-p)
     ("s" "eshell" kubed-ext-eshell-pod :if kubed-ext--pod-selected-p)
     ("!" "Exec command" kubed-ext-pods-command :if kubed-ext--pod-selected-p)
     ("i" "Init-container logs" kubed-ext-logs-init-container :if kubed-ext--pod-selected-p)
@@ -325,9 +339,13 @@ Native Kubed commands stay native.  Enhanced mode workflow keys supplement
 resource-module marking/filter/refresh keys without overriding their functions."
   (interactive)
   (dolist (map (list kubed-list-mode-map kubed-ext-resources-mode-map
-                     kubed-ext-log-mode-map kubed-ext-top-mode-map))
+                     kubed-ext-pods-mode-map kubed-ext-log-mode-map
+                     kubed-ext-top-mode-map))
     (kubed-ext--install-binding map "?" #'kubed-ext-transient-menu))
-  (dolist (binding '(("RET" . kubed-ext-show-resource)
+  (dolist (binding '(("r" . kubed-ext-switch-resource)
+                     ("c" . kubed-ext-switch-context)
+                     ("n" . kubed-ext-switch-namespace)
+                     ("RET" . kubed-ext-show-resource)
                      ("d" . kubed-ext-describe-resource)
                      ("y" . kubed-ext-copy-popup)
                      ("l" . kubed-ext-selected-logs)
@@ -339,12 +357,36 @@ resource-module marking/filter/refresh keys without overriding their functions."
                      ("f" . kubed-ext-pods-forward-port)
                      ("F" . kubed-ext-list-port-forwards)
                      ("v" . kubed-ext-vterm-pod)
+                     ("G" . kubed-ext-ghostel-pod)
+                     ("A" . kubed-ext-eat-pod)
+                     ("T" . kubed-ext-ansi-term-pod)
+                     ("s" . kubed-ext-eshell-pod)
                      ("!" . kubed-ext-pods-command)
                      ("D" . kubed-ext-delete-resource)
                      ("x" . kubed-ext-delete-marked)
                      ("L" . kubed-ext-list-set-label-selector)
                      ("b" . kubed-ext-switch-buffer)))
+    (dolist (map (list kubed-ext-resources-mode-map kubed-ext-pods-mode-map))
+      (kubed-ext--install-binding map (car binding) (cdr binding))))
+  ;; Meaningful in any resource table.
+  (dolist (binding '(("i" . kubed-ext-logs-init-container)
+                     ("o" . kubed-ext-toggle-output-format)
+                     ("H" . kubed-ext-show-command-log)
+                     ("W" . kubed-ext-list-pods)
+                     ("P" . kubed-ext-strimzi-pause-at-point)
+                     ("S" . kubed-ext-strimzi-resume-at-point)))
+    (dolist (map (list kubed-ext-resources-mode-map kubed-ext-pods-mode-map))
+      (kubed-ext--install-binding map (car binding) (cdr binding))))
+  ;; Only the enhanced list owns a filter, auto-refresh and column width.
+  (dolist (binding '(("a" . kubed-ext-auto-refresh-mode)
+                     ("C" . kubed-ext-refresh-crd-columns)))
     (kubed-ext--install-binding kubed-ext-resources-mode-map
+                                (car binding) (cdr binding)))
+  (dolist (binding '(("k" . kubed-ext-stop-logs)
+                     ("t" . kubed-ext-log-toggle-follow)
+                     ("E" . kubed-ext-log-set-filter)
+                     ("g" . kubed-ext-restart-logs)))
+    (kubed-ext--install-binding kubed-ext-log-mode-map
                                 (car binding) (cdr binding)))
   (advice-add 'kubed-ext--action-run :after #'kubed-ext--record-action-command)
   (advice-add 'kubed-local-context :filter-return #'kubed-ext--native-context)

@@ -153,9 +153,16 @@ contribute both to startup peaks and to steady-state requirements."
     (tabulated-list-print t)))
 (define-derived-mode kubed-ext-top-mode tabulated-list-mode "Kubed top"
   "Asynchronous CPU and memory usage, requests and limits."
-  (setq tabulated-list-format [("Name" 30 t) ("Namespace" 22 t) ("CPU" 12 t)
-                               ("CPU requests" 14 t) ("CPU limits" 14 t) ("Memory" 14 t)
-                               ("Mem requests" 16 t) ("Mem limits" 16 t)])
+  ;; Metric cells are quantities such as 100m or 1Gi, which do not compare
+  ;; correctly as strings.
+  (setq tabulated-list-format
+        (vconcat (list '("Name" 30 t) '("Namespace" 22 t))
+                 (cl-loop for (title width) in '(("CPU" 12) ("CPU requests" 14)
+                                                 ("CPU limits" 14) ("Memory" 14)
+                                                 ("Mem requests" 16) ("Mem limits" 16))
+                          for column from 2
+                          collect (list title width
+                                        (kubed-ext-top-numeric-sorter column)))))
   (tabulated-list-init-header)
   (kubed-ext--own-buffer #'kubed-ext--top-cancel))
 (keymap-set kubed-ext-top-mode-map "g" #'kubed-ext-top-refresh)

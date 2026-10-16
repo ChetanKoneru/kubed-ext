@@ -16,7 +16,23 @@
 (defvar-local kubed-ext--terminal-environment nil)
 (declare-function vterm "ext:vterm" (&optional buffer-name))
 (declare-function eat "ext:eat" (&optional program new-buffer-name))
-(declare-function ghostel-exec "ext:ghostel" (buffer program &optional args))
+(declare-function ghostel-exec "ext:ghostel" (buffer program &optional args identity))
+(declare-function kubed-tramp-assert-support "kubed-tramp" ())
+(declare-function kubed-tramp-enable "kubed-tramp" ())
+
+(defun kubed-ext--pod-remote-file-name (context namespace pod container &optional file-name)
+  "Return the Kubed TRAMP FILE-NAME of POD/CONTAINER in CONTEXT/NAMESPACE.
+Unlike `kubed-remote-file-name', this never prompts through synchronous
+container discovery: CONTAINER is already resolved asynchronously.  An
+existing remote host is preserved as a TRAMP hop."
+  ;; Tramp support is registered lazily; enabling is idempotent.
+  (require 'kubed-tramp)
+  (kubed-tramp-enable)
+  (kubed-tramp-assert-support)
+  (concat (if-let* ((host (file-remote-p default-directory)))
+              (concat (substring host 0 -1) "|") "/")
+          kubed-tramp-method ":" (kubed--encode-context-name context)
+          "%" namespace "%" pod "%" container ":" (or file-name "/")))
 
 (defun kubed-ext--read-pod-container-async
     (pod prompt context namespace callback &optional init-container guess)
@@ -58,7 +74,10 @@ for asynchronous commands and never requests an interactive terminal."
            (kubed-ext--action-scope "pod" pod context namespace))
           (when container (list "--container" container))
           (when tty '("-i" "-t"))
-          (list "--") (if (listp shell) shell (list (or shell kubed-ext-pod-shell)))))
+          (list "--")
+          ;; `listp' is true for nil, which silently produced
+          ;; `kubectl exec ... --' with no command at all.
+          (if (consp shell) shell (list (or shell kubed-ext-pod-shell)))))
 
 (defun kubed-ext--kubectl-exec-command (pod container context namespace shell)
   "Return a quoted SHELL command for POD/CONTAINER in CONTEXT/NAMESPACE."
@@ -87,18 +106,20 @@ for asynchronous commands and never requests an interactive terminal."
         ('ghostel
          (unless (require 'ghostel nil t) (user-error "Optional ghostel package is not installed"))
          (setq buffer (get-buffer-create name))
-         (ghostel-exec buffer (car argv) (cdr argv)) (pop-to-buffer buffer))
+         ;; Ghostel sizes the terminal to the displayed window, falling back
+         ;; to 80x24, so display the buffer before spawning kubectl exec.
+         (pop-to-buffer buffer)
+         (ghostel-exec buffer (car argv) (cdr argv)))
         ('eshell
          (let ((eshell-buffer-name name)
                (default-directory
-                (concat (if-let* ((host (file-remote-p default-directory)))
-                            (concat (substring host 0 -1) "|") "/")
-                        kubed-tramp-method ":" (kubed--encode-context-name context)
-                        "%" namespace "%" pod "%" container ":/")))
+                (kubed-ext--pod-remote-file-name context namespace pod container)))
            (setq buffer (eshell t))))
         ('ansi-term
-         ;; `term' accepts executable plus argv; no shell interpolation needed.
-         (setq buffer (apply #'make-term name (car argv) nil (cdr argv)))
+         ;; `make-term' wraps its NAME in asterisks and reuses a live buffer of
+         ;; that name, so derive the label from the unique buffer name.
+         (setq buffer (apply #'make-term (string-trim name "\\*" "\\*")
+                             (car argv) nil (cdr argv)))
          (with-current-buffer buffer (term-mode) (term-char-mode))
          (pop-to-buffer buffer))
         (_ (user-error "Unknown terminal backend: %s" backend))))
@@ -115,10 +136,16 @@ for asynchronous commands and never requests an interactive terminal."
     buffer))
 
 (defun kubed-ext--terminal-stop ()
-  "Stop only the process owned by the current terminal buffer."
-  (let ((p (gethash (current-buffer) kubed-ext--terminal-processes)))
+  "Stop the processes of the current terminal buffer.
+Eshell has no subprocess when it starts, so the recorded snapshot can be
+nil while a command launched later is still running in the buffer."
+  (let ((recorded (gethash (current-buffer) kubed-ext--terminal-processes))
+        (current (get-buffer-process (current-buffer))))
     (remhash (current-buffer) kubed-ext--terminal-processes)
-    (when (process-live-p p) (delete-process p))))
+    (dolist (process (delete-dups (list recorded current)))
+      (when (process-live-p process)
+        (set-process-query-on-exit-flag process nil)
+        (delete-process process)))))
 
 (defun kubed-ext-terminals-stop-all ()
   "Stop extension-created terminals and pending container prompts."

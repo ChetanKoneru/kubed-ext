@@ -29,9 +29,10 @@ Exceeding this limit fails visibly and discards the incomplete response."
 (defun kubed-ext--scope-label (scope)
   "Return bounded, credential-free presentation of SCOPE."
   (let* ((context (or (plist-get scope :context) "unresolved"))
-         (label (format "%s/%s [%s/%s]"
+         (name (or (plist-get scope :name) (plist-get scope :query)))
+         (label (format "%s%s [%s/%s]"
                         (or (plist-get scope :type) "")
-                        (or (plist-get scope :name) (plist-get scope :query) "")
+                        (if (and name (not (string-empty-p name))) (concat "/" name) "")
                         context (or (plist-get scope :namespace) "cluster/all")))
          (case-fold-search t))
     (setq label (truncate-string-to-width label 240 nil nil "…"))
@@ -61,69 +62,7 @@ Exceeding this limit fails visibly and discards the incomplete response."
                (with-current-buffer buffer (funcall cleanup))))
            (copy-hash-table kubed-ext--owners)))
 
-(defun kubed-ext--resolve-scope (scope namespace-policy callback)
-  "Resolve SCOPE once asynchronously, then call CALLBACK with an explicit scope.
-NAMESPACE-POLICY is `default' for row operations or `all' for lists.  Read
-only compact kubeconfig metadata, never cluster helpers or credential data.
-Honor Kubed 0.7.1's environment cache and host-configured valid defaults."
-  (let* ((environment (or (plist-get scope :environment)
-                          kubed-ext--environment (kubed-ext--capture-environment)))
-         (scope (plist-put (copy-sequence scope) :environment environment))
-         (context (plist-get scope :context))
-         (namespace (plist-get scope :namespace))
-         (origin (current-buffer)))
-    (if (and context (or namespace (eq namespace-policy 'all)))
-        (kubed-ext--with-environment environment (funcall callback scope))
-      (kubed-ext--with-environment environment
-        (let ((configured (copy-tree
-                           (or (alist-get (plist-get environment :eenv)
-                                          kubed--context-and-namespace-alist nil nil #'equal)
-                               (alist-get (file-remote-p default-directory)
-                                          kubed-default-context-and-namespace-alist nil nil #'equal)))))
-          (kubed-ext--async-kubectl
-           (list (kubed-ext--kubectl-program) "config" "view" "-o"
-                 "jsonpath={.current-context}{\"\\n\"}{range .contexts[*]}{.name}{\"\\t\"}{.context.namespace}{\"\\n\"}{end}")
-           (lambda (text)
-             (let* ((lines (split-string text "\n"))
-                    (contexts (mapcar (lambda (line) (split-string line "\t"))
-                                      (cl-remove-if #'string-empty-p (cdr lines))))
-                    (valid-default (and (assoc (car configured) contexts) configured))
-                    (effective (or context (car valid-default) (car lines))))
-               (unless (and (stringp effective) (not (string-empty-p effective)))
-                 (error "Kubeconfig has no effective context"))
-               (setq scope (plist-put scope :context effective))
-               (when (and (eq namespace-policy 'default) (not namespace))
-                 (setq scope (plist-put scope :namespace
-                                        (or (and (equal effective (car valid-default))
-                                                 (cdr valid-default))
-                                            (let ((value (cadr (assoc effective contexts))))
-                                              (unless (or (null value) (string-empty-p value)) value))
-                                            "default"))))
-               (when (buffer-live-p origin)
-                 (with-current-buffer origin
-                   (kubed-ext--with-environment environment (funcall callback scope))))))
-           (lambda (failure) (message "Kubed scope resolution failed: %s" failure))))))))
-
-(defmacro kubed-ext--at-scope (scope &rest body)
-  "Evaluate BODY at SCOPE's origin with its captured environment."
-  (declare (indent 1) (debug (form body)))
-  `(let ((snapshot-scope ,scope))
-     (with-current-buffer (or (plist-get snapshot-scope :origin) (current-buffer))
-       (kubed-ext--with-environment
-           (or (plist-get snapshot-scope :environment) kubed-ext--environment
-               (kubed-ext--capture-environment))
-         ,@body))))
-
-(defmacro kubed-ext--resolved (context namespace policy &rest body)
-  "Run BODY after resolving CONTEXT and NAMESPACE according to POLICY."
-  (declare (indent 3) (debug (form form form body)))
-  `(kubed-ext--resolve-scope
-    (list :context ,context :namespace ,namespace) ,policy
-    (lambda (resolved)
-      (let ((,context (plist-get resolved :context))
-            (,namespace (plist-get resolved :namespace)))
-        ,@body))))
-
+(defvar-local kubed-ext--environment nil "Persistent environment of an owned buffer.")
 (defvar kubed-ext--requests nil "Owned unfinished requests.")
 (defvar kubed-ext--request-queue nil "FIFO of waiting requests.")
 (defvar kubed-ext--unloading nil "Non-nil while shutting down requests.")
@@ -153,7 +92,6 @@ ownership is recovered only from extension-named runtime objects."
         kubed-ext--unloading nil))
 (defvar kubed-ext-shutdown-hook nil
   "Module cleanup functions called before request shutdown; no work may launch.")
-(defvar-local kubed-ext--environment nil "Persistent environment of an owned buffer.")
 (cl-defstruct (kubed-ext-request (:constructor kubed-ext--make-request))
   argv success error environment process stdout-buffer stderr-buffer timer
   finished completing cancelled failure started (bytes 0))
@@ -221,6 +159,70 @@ Do not call this helper on unrelated native or user buffers."
 (defun kubed-ext--kubectl-program ()
   "Return the captured or connection-local Kubed executable."
   (or (plist-get kubed-ext--environment :kubectl) (kubed-kubectl-program)))
+
+
+(defun kubed-ext--resolve-scope (scope namespace-policy callback)
+  "Resolve SCOPE once asynchronously, then call CALLBACK with an explicit scope.
+NAMESPACE-POLICY is `default' for row operations or `all' for lists.  Read
+only compact kubeconfig metadata, never cluster helpers or credential data.
+Honor Kubed 0.7.1's environment cache and host-configured valid defaults."
+  (let* ((environment (or (plist-get scope :environment)
+                          kubed-ext--environment (kubed-ext--capture-environment)))
+         (scope (plist-put (copy-sequence scope) :environment environment))
+         (context (plist-get scope :context))
+         (namespace (plist-get scope :namespace))
+         (origin (current-buffer)))
+    (if (and context (or namespace (eq namespace-policy 'all)))
+        (kubed-ext--with-environment environment (funcall callback scope))
+      (kubed-ext--with-environment environment
+        (let ((configured (copy-tree
+                           (or (alist-get (plist-get environment :eenv)
+                                          kubed--context-and-namespace-alist nil nil #'equal)
+                               (alist-get (file-remote-p default-directory)
+                                          kubed-default-context-and-namespace-alist nil nil #'equal)))))
+          (kubed-ext--async-kubectl
+           (list (kubed-ext--kubectl-program) "config" "view" "-o"
+                 "jsonpath={.current-context}{\"\\n\"}{range .contexts[*]}{.name}{\"\\t\"}{.context.namespace}{\"\\n\"}{end}")
+           (lambda (text)
+             (let* ((lines (split-string text "\n"))
+                    (contexts (mapcar (lambda (line) (split-string line "\t"))
+                                      (cl-remove-if #'string-empty-p (cdr lines))))
+                    (valid-default (and (assoc (car configured) contexts) configured))
+                    (effective (or context (car valid-default) (car lines))))
+               (unless (and (stringp effective) (not (string-empty-p effective)))
+                 (error "Kubeconfig has no effective context"))
+               (setq scope (plist-put scope :context effective))
+               (when (and (eq namespace-policy 'default) (not namespace))
+                 (setq scope (plist-put scope :namespace
+                                        (or (and (equal effective (car valid-default))
+                                                 (cdr valid-default))
+                                            (let ((value (cadr (assoc effective contexts))))
+                                              (unless (or (null value) (string-empty-p value)) value))
+                                            "default"))))
+               (when (buffer-live-p origin)
+                 (with-current-buffer origin
+                   (kubed-ext--with-environment environment (funcall callback scope))))))
+           (lambda (failure) (message "Kubed scope resolution failed: %s" failure))))))))
+
+(defmacro kubed-ext--at-scope (scope &rest body)
+  "Evaluate BODY at SCOPE's origin with its captured environment."
+  (declare (indent 1) (debug (form body)))
+  `(let ((snapshot-scope ,scope))
+     (with-current-buffer (or (plist-get snapshot-scope :origin) (current-buffer))
+       (kubed-ext--with-environment
+           (or (plist-get snapshot-scope :environment) kubed-ext--environment
+               (kubed-ext--capture-environment))
+         ,@body))))
+
+(defmacro kubed-ext--resolved (context namespace policy &rest body)
+  "Run BODY after resolving CONTEXT and NAMESPACE according to POLICY."
+  (declare (indent 3) (debug (form form form body)))
+  `(kubed-ext--resolve-scope
+    (list :context ,context :namespace ,namespace) ,policy
+    (lambda (resolved)
+      (let ((,context (plist-get resolved :context))
+            (,namespace (plist-get resolved :namespace)))
+        ,@body))))
 
 (defun kubed-ext-request-finished-p (request)
   "Return whether REQUEST has completed and released its resources."
