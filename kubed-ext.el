@@ -21,6 +21,24 @@
 (require 'kubed-ext-terminals)
 (require 'kubed-ext-pods)
 
+(defcustom kubed-ext-native-list-keys 'free
+  "Which extension keys are installed in native Kubed lists.
+
+Kubed binds many single keys itself, so this controls how far the extension
+reaches into `kubed-list-mode-map\='.
+
+`free\=' installs only keys Kubed leaves unbound, shadowing nothing.
+`all\=' installs every key, shadowing the native binding.
+nil installs nothing beyond the transient menu.
+
+A key bound by a resource-specific map, such as `l\=' in pod lists, keeps its
+native command either way, because that map takes precedence.
+`kubed-ext-disable\=' restores whatever was replaced."
+  :type '(choice (const :tag "Only keys Kubed leaves free" free)
+                 (const :tag "All keys, shadowing Kubed" all)
+                 (const :tag "None" nil))
+  :group 'kubed-ext)
+
 (defvar kubed-ext--installed-bindings nil
   "Owned binding snapshots: (MAP KEY ORIGINAL INSTALLED).")
 (defvar kubed-ext--command-history nil
@@ -332,17 +350,8 @@ recorded.  Commands are shell-quoted for copying, never executed here."
     ("q" "Close menu" transient-quit-one)
     ("Q" "Disable extension" kubed-ext-disable)]])
 
-;;;###autoload
-(defun kubed-ext-setup ()
-  "Install idempotent, reversible integration without contacting a cluster.
-Native Kubed commands stay native.  Enhanced mode workflow keys supplement
-resource-module marking/filter/refresh keys without overriding their functions."
-  (interactive)
-  (dolist (map (list kubed-list-mode-map kubed-ext-resources-mode-map
-                     kubed-ext-pods-mode-map kubed-ext-log-mode-map
-                     kubed-ext-top-mode-map))
-    (kubed-ext--install-binding map "?" #'kubed-ext-transient-menu))
-  (dolist (binding '(("r" . kubed-ext-switch-resource)
+(defconst kubed-ext--row-bindings
+  '(("r" . kubed-ext-switch-resource)
                      ("c" . kubed-ext-switch-context)
                      ("n" . kubed-ext-switch-namespace)
                      ("RET" . kubed-ext-show-resource)
@@ -365,7 +374,20 @@ resource-module marking/filter/refresh keys without overriding their functions."
                      ("D" . kubed-ext-delete-resource)
                      ("x" . kubed-ext-delete-marked)
                      ("L" . kubed-ext-list-set-label-selector)
-                     ("b" . kubed-ext-switch-buffer)))
+                     ("b" . kubed-ext-switch-buffer))
+  "Row and navigation keys installed in every resource table.")
+
+;;;###autoload
+(defun kubed-ext-setup ()
+  "Install idempotent, reversible integration without contacting a cluster.
+Native Kubed commands stay native.  Enhanced mode workflow keys supplement
+resource-module marking/filter/refresh keys without overriding their functions."
+  (interactive)
+  (dolist (map (list kubed-list-mode-map kubed-ext-resources-mode-map
+                     kubed-ext-pods-mode-map kubed-ext-log-mode-map
+                     kubed-ext-top-mode-map))
+    (kubed-ext--install-binding map "?" #'kubed-ext-transient-menu))
+  (dolist (binding kubed-ext--row-bindings)
     (dolist (map (list kubed-ext-resources-mode-map kubed-ext-pods-mode-map))
       (kubed-ext--install-binding map (car binding) (cdr binding))))
   ;; Meaningful in any resource table.
@@ -388,6 +410,16 @@ resource-module marking/filter/refresh keys without overriding their functions."
                      ("g" . kubed-ext-restart-logs)))
     (kubed-ext--install-binding kubed-ext-log-mode-map
                                 (car binding) (cdr binding)))
+  (when kubed-ext-native-list-keys
+    (dolist (binding (append kubed-ext--row-bindings
+                             '(("i" . kubed-ext-logs-init-container)
+                               ("H" . kubed-ext-show-command-log)
+                               ("W" . kubed-ext-list-pods)
+                               ("S" . kubed-ext-strimzi-resume-at-point))))
+      (when (or (eq kubed-ext-native-list-keys 'all)
+                (not (keymap-lookup kubed-list-mode-map (car binding))))
+        (kubed-ext--install-binding kubed-list-mode-map
+                                    (car binding) (cdr binding)))))
   (advice-add 'kubed-ext--action-run :after #'kubed-ext--record-action-command)
   (advice-add 'kubed-local-context :filter-return #'kubed-ext--native-context)
   (advice-add 'kubed-update :before #'kubed-ext--validate-native-update)

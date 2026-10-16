@@ -5,8 +5,7 @@
 
 =kubed-ext= adds isolated asynchronous resource tables, Stern logs, metrics,
 scoped actions and terminals to [[https://github.com/eshelyaron/kubed][Kubed]]. Native Kubed remains the base client.
-This is not complete k9s parity. See the [[file:docs/superpowers/verification/2026-11-14-modular-kubernetes-client.md][verification and compatibility report]]
-for measured results and remaining gaps.
+This is not complete k9s parity.
 
 * Dependencies and loading
 
@@ -37,7 +36,10 @@ make sure they are available in Emacs's =exec-path=.
   (kubed-ext-stern-program "stern")
   (kubed-ext-crd-discovery-enabled t)
   (kubed-ext-resource-display-limit 1000)
-  (kubed-ext-log-retention-characters 200000))
+  (kubed-ext-log-retention-characters 200000)
+  ;; Also bind extension keys in native Kubed lists.  `free' adds only keys
+  ;; Kubed leaves unbound; use `all' to shadow Kubed's own keys instead.
+  (kubed-ext-native-list-keys 'free))
 #+end_src
 
 Loading =kubed-ext= installs its integration automatically; no additional
@@ -71,12 +73,78 @@ Run ERT in the existing Emacs session with =M-x ert=; test names start with
 =kubed-ext-=. When reusing a development session, select tests from current
 source files rather than obsolete tests left registered by earlier revisions.
 
+* Configuration
+
+All options are in the =kubed-ext= customization group.
+
+** Keys in native Kubed lists
+
+=kubed-ext-native-list-keys= decides how far setup reaches into
+=kubed-list-mode-map=:
+
+| Value | Effect |
+|-------+--------|
+| ='free= (default) | Install only keys Kubed leaves unbound; shadow nothing |
+| ='all= | Install every key, shadowing Kubed's own command |
+| =nil= | Install nothing beyond =?= |
+
+Under =free=, native lists gain =r c n b= navigation, =v G A T s= terminals,
+=l y f F h R p N i L W H S=, while Kubed keeps =d e ! / g x D P RET o w u +=.
+A key bound by a resource-specific map, such as =l= in pod lists, keeps its
+native command under both policies, because that map takes precedence over
+=kubed-list-mode-map=. =kubed-ext-disable= restores every replaced binding.
+
+** Resource table columns
+
+| Option | Default | Effect |
+|--------+---------+--------|
+| =kubed-ext-resource-wide-output= | =t= | Request =kubectl -o wide=, adding NODE and IP to pods |
+| =kubed-ext-resource-hidden-columns= | =("NOMINATED NODE" "READINESS GATES")= | Server columns omitted from display |
+| =kubed-ext-resource-column-max-width= | =48= | Maximum rendered width of a column |
+
+Column widths follow the widest value actually present, so tables with long
+names stay aligned with their headers. =w= toggles wide output per view.
+NAME and NAMESPACE are never hidden, because row identity depends on them.
+
+** Output highlighting
+
+| Option | Default | Effect |
+|--------+---------+--------|
+| =kubed-ext-highlight-output= | =t= | Syntax-highlight YAML/JSON output |
+| =kubed-ext-highlight-describe= | =t= | Highlight =describe= output with the YAML mode |
+| =kubed-ext-yaml-modes= | =(yaml-ts-mode yaml-mode)= | Modes tried for YAML, best first |
+| =kubed-ext-json-modes= | =(json-ts-mode json-mode js-json-mode)= | Modes tried for JSON, best first |
+
+A tree-sitter mode is skipped unless its grammar is installed, falling back to
+the next mode and finally to plain =special-mode=. Output buffers stay
+read-only and keep =q= bound to =quit-window=. Describe output is not YAML,
+but its indented key/value shape highlights closely enough to be useful; set
+=kubed-ext-highlight-describe= to =nil= to leave it plain.
+
+** Pod usage table
+
+=kubed-ext-list-pods= (=W=) joins =kubectl get pods -o json=, =kubectl top
+pods= and this package's own port-forward registry:
+
+: NAME  PF  READY  STATUS  RESTARTS  CPU  %CPU/R  %CPU/L  MEM  %MEM/R  %MEM/L  IP  NODE  AGE
+
+Usage is optional: without metrics-server the table still renders, with =n/a=
+in the usage columns. Percentages are usage over the pod's declared request or
+limit, so =n/a= means nothing was declared, not zero. Metric columns, restarts
+and age sort numerically rather than as text.
+
+=kubed-ext-pods-usage-warning= (80) and =kubed-ext-pods-usage-critical= (100)
+set the percentages highlighted with =kubed-ext-pods-warning= and
+=kubed-ext-pods-critical=. STATUS, READY and RESTARTS use the same faces, and
+=kubed-ext-pods-forwarded= marks a ready port forward.
+
 * Native and enhanced keys
 
-Setup changes only =?= in native =kubed-list-mode-map=. Native =g= refresh,
-=RET= resource selection, =/= filter, =d= mark-for-deletion, =u= unmark,
-=x= delete-marked, =D= delete, =e= edit, =!= kubectl command, =w= copy,
-and =+= create remain upstream Kubed commands. Native marking and caches are
+Setup installs =?= in native =kubed-list-mode-map=, plus the keys allowed by
+=kubed-ext-native-list-keys= (see Configuration). Under the default =free=
+policy, native =g= refresh, =RET= resource selection, =/= filter,
+=d= mark-for-deletion, =u= unmark, =x= delete-marked, =D= delete, =e= edit,
+=!= kubectl command, =w= copy and =+= create remain upstream Kubed commands. Native marking and caches are
 not replaced by enhanced ones. =?= also opens the menu in enhanced tables,
 managed logs and metric buffers.
 
@@ -96,11 +164,16 @@ by that module):
 | =v= / =!= | Pod vterm / prompted non-TTY exec with container discovery |
 | =D= / =x= | Confirmed selected / marked deletion |
 | =L= / =b= / =?= | Server label selector / buffer chooser / menu |
+| =r= / =c= / =n= | Switch resource / context / namespace, with completion |
+| =w= / =a= / =C= | Wide =-o wide= columns / auto-refresh / refresh CRD metadata |
+| =G= / =A= / =T= / =s= | Pod ghostel / eat / ansi-term / eshell |
+| =W= / =i= / =o= / =H= | Pod usage table / init-container logs / output format / action history |
 
 Direct action keys validate their target or request a target. The menu hides
 row actions on headers and hides pod/rollout/log/Strimzi actions for unsupported
 selected types. Menu keys are unique: =r c n b g= navigate/refresh;
-=/ L a p N C= enhanced filtering/auto-refresh/metrics/CRD metadata;
+=/ L a w p W N C= filtering, auto-refresh, wide columns, metrics, pod usage
+table and CRD metadata;
 =RET d y l e h R f D= selected actions;
 =v s ! i P S= pod terminal/exec/init logs and Strimzi pause/resume;
 =F o H= forwards/output format/action history; =k t E= log stop/follow/filter;
@@ -128,14 +201,19 @@ or evaluated resource definitions. Secret list views use server tables;
 YAML/JSON Secret-value retrieval is deliberately rejected.
 
 =kubed-ext-switch-context= and =kubed-ext-switch-namespace= preserve the current
-resource and selector. Resource switching uses the resource module's completion
+resource and selector, and complete over the contexts of the kubeconfig and the
+namespaces of the current context. Candidates are fetched asynchronously and
+cached per environment and context, so the prompt never blocks; an unknown name
+is still accepted after confirmation, which keeps navigation working when
+listing namespaces is denied. From the pod usage table both commands reopen
+that table rather than the generic list. Resource switching uses the resource module's completion
 and opens an enhanced table. Convenience =kubed-ext-jump-*= commands retain
 scope. Enhanced marks/filter/sort and identities stay buffer-local. Namespaced
 rows always use a stable =namespace/name= identity, including scoped refreshes
 whose server table omits =NAMESPACE=; cluster-scoped rows use their bare name.
 Rendered rows are capped at =kubed-ext-resource-display-limit= (1000 by
 default), with explicit =+= expansion up to =kubed-ext-resource-retain-limit=
-(5000). Parsing runs in 100-row idle batches. A cold CRD namespace view filters
+(5000). Parsing runs in 500-row batches that yield to redisplay. A cold CRD namespace view filters
 matching rows before the retention cap, so later target rows are not hidden by
 unrelated namespaces. Truncated datasets report the retention limit; narrow the
 namespace or selector for more rows. Auto-refresh is buffer-local
